@@ -1,8 +1,8 @@
+
 name: Generate Translation Strings
 on:
-  push:
-    branches:
-      - dev
+  workflow_dispatch:
+  # Automatic triggers removed; invoke through FounderOS/Admin Gate.
 env:
   DEFAULT_UV_VERSION: "0.11.x"
 jobs:

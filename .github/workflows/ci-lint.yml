@@ -1,11 +1,8 @@
+
 name: Lint
 on:
-  push:
-    branches-ignore:
-      - 'translations**'
-  pull_request:
-    branches-ignore:
-      - 'translations**'
+  workflow_dispatch:
+  # Automatic triggers removed; invoke through FounderOS/Admin Gate.
 concurrency:
   group: lint-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
