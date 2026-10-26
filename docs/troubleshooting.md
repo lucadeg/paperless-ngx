@@ -10,9 +10,9 @@ Check for the following issues:
   `CONSUMPTION_DIR` setting. Don't adjust this setting if you're
   using docker.
 
-- Ensure that redis is up and running. Paperless does its task
+- Ensure that the broker is up and running. Paperless does its task
   processing asynchronously, and for documents to arrive at the task
-  processor, it needs redis to run.
+  processor, it needs the broker to run.
 
 - Ensure that the task processor is running. Docker does this
   automatically. Manually invoke the task processor by executing
@@ -129,7 +129,7 @@ change in the `docker-compose.yml` file:
 command:
   - 'gotenberg'
   - '--chromium-disable-javascript=true'
-  - '--chromium-allow-list=file:///tmp/.*'
+  - '--chromium-allow-list=^file:///tmp/.*'
   - '--api-timeout=60s'
 ```
 
@@ -148,37 +148,6 @@ operating system, if these are different from `1000`. See [Docker setup](setup.m
 
 Also ensure that you are able to read and write to the consumption
 directory on the host.
-
-## OSError: \[Errno 19\] No such device when consuming files
-
-If you experience errors such as:
-
-```shell-session
-File "/usr/local/lib/python3.7/site-packages/whoosh/codec/base.py", line 570, in open_compound_file
-return CompoundStorage(dbfile, use_mmap=storage.supports_mmap)
-File "/usr/local/lib/python3.7/site-packages/whoosh/filedb/compound.py", line 75, in __init__
-self._source = mmap.mmap(fileno, 0, access=mmap.ACCESS_READ)
-OSError: [Errno 19] No such device
-
-During handling of the above exception, another exception occurred:
-
-Traceback (most recent call last):
-File "/usr/local/lib/python3.7/site-packages/django_q/cluster.py", line 436, in worker
-res = f(*task["args"], **task["kwargs"])
-File "/usr/src/paperless/src/documents/tasks.py", line 73, in consume_file
-override_tag_ids=override_tag_ids)
-File "/usr/src/paperless/src/documents/consumer.py", line 271, in try_consume_file
-raise ConsumerError(e)
-```
-
-Paperless uses a search index to provide better and faster full text
-searching. This search index is stored inside the `data` folder. The
-search index uses memory-mapped files (mmap). The above error indicates
-that paperless was unable to create and open these files.
-
-This happens when you're trying to store the data directory on certain
-file systems (mostly network shares) that don't support memory-mapped
-files.
 
 ## Web-UI stuck at "Loading\..."
 
@@ -302,6 +271,65 @@ This error can occur in installations which have upgraded from a version of Pape
 ```shell-session
 $ python3 manage.py convert_mariadb_uuid
 ```
+
+## MariaDB/MySQL error "Illegal mix of collations"
+
+Consumption or other operations fail with an error like:
+
+```
+(1267, "Illegal mix of collations (utf8mb4_general_ci,IMPLICIT) and
+(utf8mb4_unicode_ci,IMPLICIT) for operation '='")
+```
+
+This happens when the tables in your database do not all use the same
+collation. It is most often seen on databases that existed before a
+MariaDB/MySQL upgrade: older tables keep their original collation, while
+tables created afterwards use the new server default.
+
+To work around it, set the collation your existing tables use (the one in the error
+that is not `utf8mb4_unicode_ci`) with
+[`PAPERLESS_DB_OPTIONS`](configuration.md#PAPERLESS_DB_OPTIONS):
+
+```bash
+PAPERLESS_DB_OPTIONS="collation=utf8mb4_general_ci"
+```
+
+To fix it permanently, back up your database, then convert the database and
+each table to a single collation and remove the override:
+
+```sql
+ALTER DATABASE paperless CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+ALTER TABLE <table_name> CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+```
+
+## PostgreSQL warns about a "collation version mismatch"
+
+The PostgreSQL log shows a warning like:
+
+```
+WARNING:  database "paperless" has a collation version mismatch
+DETAIL:  The database was created using collation version 2.36, but the operating system provides version 2.41.
+HINT:  Rebuild all objects in this database that use the default collation and run ALTER DATABASE paperless REFRESH COLLATION VERSION, or build PostgreSQL with the right library version.
+```
+
+This comes from PostgreSQL, not Paperless-ngx. The `glibc` version that PostgreSQL
+runs against changed, and the existing database was created with an older one. With
+Docker, `glibc` comes from the PostgreSQL image's Debian base, not the host, so this
+commonly happens when a new image is pulled after its base Debian release changed.
+If PostgreSQL is installed directly on a host, it uses the host's `glibc` instead.
+
+The warning is not an error and Paperless-ngx keeps working, but the database's text
+indexes may be built with outdated sorting rules. To resolve it, back up your
+database, then connect to it (for example with `psql -U paperless -d paperless`
+inside the database container) and run:
+
+```sql
+REINDEX DATABASE paperless;
+ALTER DATABASE paperless REFRESH COLLATION VERSION;
+```
+
+To avoid this in the future, pin your PostgreSQL image to a specific Debian release,
+for example `postgres:18-trixie`, rather than `postgres:18`.
 
 ## Platform-Specific Deployment Troubleshooting
 

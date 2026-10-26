@@ -146,6 +146,19 @@ describe('DocumentListComponent', () => {
     expect(reloadSpy).toHaveBeenCalled()
   })
 
+  it('should stop reloading on document deleted after destroy', () => {
+    const reloadSpy = jest.spyOn(documentListService, 'reload')
+    const documentDeletedSubject = new Subject<boolean>()
+    jest
+      .spyOn(websocketStatusService, 'onDocumentDeleted')
+      .mockReturnValue(documentDeletedSubject)
+    fixture.detectChanges()
+    fixture.destroy()
+    reloadSpy.mockClear()
+    documentDeletedSubject.next(true)
+    expect(reloadSpy).not.toHaveBeenCalled()
+  })
+
   it('should show score sort fields on fulltext queries', () => {
     documentListService.setFilterRules([
       {
@@ -474,7 +487,7 @@ describe('DocumentListComponent', () => {
     delete modifiedView.name
     const savedViewServicePatch = jest.spyOn(savedViewService, 'patch')
     savedViewServicePatch.mockReturnValue(of(modifiedView))
-    const toastSpy = jest.spyOn(toastService, 'showInfo')
+    const toastSpy = jest.spyOn(toastService, 'showSuccess')
 
     component.saveViewConfig()
     expect(savedViewServicePatch).toHaveBeenCalledWith(modifiedView)
@@ -579,7 +592,7 @@ describe('DocumentListComponent', () => {
     let openModal: NgbModalRef
     modalService.activeInstances.subscribe((modal) => (openModal = modal[0]))
     const modalSpy = jest.spyOn(modalService, 'open')
-    const toastSpy = jest.spyOn(toastService, 'showInfo')
+    const toastSpy = jest.spyOn(toastService, 'showSuccess')
     const savedViewServiceCreate = jest.spyOn(savedViewService, 'create')
     jest
       .spyOn(savedViewService, 'dashboardViews', 'get')
@@ -730,7 +743,9 @@ describe('DocumentListComponent', () => {
       showInSideBar: true,
     })
     expect(updateVisibilitySpy).not.toHaveBeenCalled()
-    expect(openModal.componentInstance.error).toEqual({ filter_rules: ['11'] })
+    expect(openModal.componentInstance.error()).toEqual({
+      filter_rules: ['11'],
+    })
   })
 
   it('should detect saved view changes', () => {
@@ -777,7 +792,7 @@ describe('DocumentListComponent', () => {
   })
 
   it('should hide columns if no perms or notes disabled', () => {
-    jest.spyOn(permissionService, 'currentUserCan').mockReturnValue(true)
+    permissionService.initialize([], { is_superuser: true } as any)
     jest.spyOn(documentListService, 'documents', 'get').mockReturnValue(docs)
     expect(documentListService.sortField).toEqual('created')
 
@@ -798,7 +813,7 @@ describe('DocumentListComponent', () => {
     ).toHaveLength(9)
 
     // insufficient perms
-    jest.spyOn(permissionService, 'currentUserCan').mockReturnValue(false)
+    permissionService.initialize([], { is_superuser: false } as any)
     fixture.detectChanges()
     expect(
       fixture.debugElement.queryAll(By.directive(SortableDirective))
@@ -837,11 +852,10 @@ describe('DocumentListComponent', () => {
 
   it('should get custom field title', () => {
     fixture.detectChanges()
-    jest
-      .spyOn(settingsService, 'allDisplayFields', 'get')
-      .mockReturnValue([
-        { id: 'custom_field_1' as any, name: 'Custom Field 1' },
-      ])
+    const mockDisplayFields = [
+      { id: 'custom_field_1' as any, name: 'Custom Field 1' },
+    ]
+    settingsService.allDisplayFields = jest.fn(() => mockDisplayFields) as any
     expect(component.getDisplayCustomFieldTitle('custom_field_1')).toEqual(
       'Custom Field 1'
     )

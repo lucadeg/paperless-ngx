@@ -4,14 +4,9 @@ import {
   HttpTestingController,
   provideHttpClientTesting,
 } from '@angular/common/http/testing'
-import {
-  ComponentFixture,
-  TestBed,
-  fakeAsync,
-  tick,
-} from '@angular/core/testing'
+import { ComponentFixture, TestBed } from '@angular/core/testing'
 import { FormsModule, ReactiveFormsModule } from '@angular/forms'
-import { BrowserModule } from '@angular/platform-browser'
+import { BrowserModule, By } from '@angular/platform-browser'
 import { ActivatedRoute, Router } from '@angular/router'
 import { RouterTestingModule } from '@angular/router/testing'
 import { NgbModal, NgbModalModule, NgbModule } from '@ng-bootstrap/ng-bootstrap'
@@ -20,7 +15,7 @@ import { provideUiTour } from 'ngx-ui-tour-ng-bootstrap'
 import { of, throwError } from 'rxjs'
 import { routes } from 'src/app/app-routing.module'
 import { SavedView } from 'src/app/data/saved-view'
-import { SETTINGS_KEYS } from 'src/app/data/ui-settings'
+import { HideableSidebarItemID, SETTINGS_KEYS } from 'src/app/data/ui-settings'
 import { IfPermissionsDirective } from 'src/app/directives/if-permissions.directive'
 import { PermissionsGuard } from 'src/app/guards/permissions.guard'
 import {
@@ -38,8 +33,11 @@ import { SearchService } from 'src/app/services/rest/search.service'
 import { SettingsService } from 'src/app/services/settings.service'
 import { TasksService } from 'src/app/services/tasks.service'
 import { ToastService } from 'src/app/services/toast.service'
+import { UploadDocumentsService } from 'src/app/services/upload-documents.service'
+import { WebsocketStatusService } from 'src/app/services/websocket-status.service'
 import { environment } from 'src/environments/environment'
 import { ProfileEditDialogComponent } from '../common/profile-edit-dialog/profile-edit-dialog.component'
+import { UploadStatusTrayComponent } from '../common/upload-status-tray/upload-status-tray.component'
 import { DocumentDetailComponent } from '../document-detail/document-detail.component'
 import { AppFrameComponent } from './app-frame.component'
 import { GlobalSearchComponent } from './global-search/global-search.component'
@@ -198,6 +196,23 @@ describe('AppFrameComponent', () => {
     expect(savedViewSpy).toHaveBeenCalled()
   })
 
+  it('should update reinitialized signal-backed settings without manual change detection', async () => {
+    settingsService.initializeSettings().subscribe()
+    httpTestingController
+      .expectOne(`${environment.apiBaseUrl}ui_settings/`)
+      .flush({
+        settings: { app_title: 'Reactive title' },
+        user: {},
+        permissions: [],
+      })
+
+    await fixture.whenStable()
+
+    expect(
+      fixture.nativeElement.querySelector('.brand-title').textContent
+    ).toBe('Reactive title')
+  })
+
   it('should check for update if enabled', () => {
     const updateCheckSpy = jest.spyOn(remoteVersionService, 'checkForUpdates')
     updateCheckSpy.mockImplementation(() => {
@@ -244,11 +259,12 @@ describe('AppFrameComponent', () => {
     expect(toastSpy).toHaveBeenCalled()
   })
 
-  it('should support toggling slim sidebar and saving', fakeAsync(() => {
+  it('should support toggling slim sidebar and saving', () => {
+    jest.useFakeTimers()
     const saveSettingSpy = jest.spyOn(settingsService, 'set')
     settingsService.set(SETTINGS_KEYS.ATTRIBUTES_SECTIONS_COLLAPSED, [])
     expect(component.slimSidebarEnabled).toBeFalsy()
-    expect(component.slimSidebarAnimating).toBeFalsy()
+    expect(component.slimSidebarAnimating()).toBeFalsy()
     component.toggleSlimSidebar()
     const requests = httpTestingController.match(
       `${environment.apiBaseUrl}ui_settings/`
@@ -259,9 +275,9 @@ describe('AppFrameComponent', () => {
       requests[0].request.body.settings.attributes_sections_collapsed
     ).toEqual(['attributes'])
     requests[0].flush({ success: true })
-    expect(component.slimSidebarAnimating).toBeTruthy()
-    tick(200)
-    expect(component.slimSidebarAnimating).toBeFalsy()
+    expect(component.slimSidebarAnimating()).toBeTruthy()
+    jest.advanceTimersByTime(200)
+    expect(component.slimSidebarAnimating()).toBeFalsy()
     expect(component.slimSidebarEnabled).toBeTruthy()
     expect(saveSettingSpy).toHaveBeenCalledWith(
       SETTINGS_KEYS.SLIM_SIDEBAR,
@@ -271,7 +287,89 @@ describe('AppFrameComponent', () => {
       SETTINGS_KEYS.ATTRIBUTES_SECTIONS_COLLAPSED,
       ['attributes']
     )
-  }))
+    jest.useRealTimers()
+  })
+
+  it('should hide configured sidebar items', () => {
+    settingsService.set(SETTINGS_KEYS.SIDEBAR_HIDDEN_ITEMS, [
+      HideableSidebarItemID.Dashboard,
+      HideableSidebarItemID.Workflows,
+      HideableSidebarItemID.ShareLinks,
+    ])
+    fixture.detectChanges()
+
+    expect(
+      fixture.nativeElement.querySelector('[routerLink="dashboard"]')
+        .parentElement.classList
+    ).toContain('d-none')
+    expect(
+      fixture.nativeElement.querySelector('[routerLink="workflows"]')
+        .parentElement.classList
+    ).toContain('d-none')
+    expect(
+      fixture.nativeElement.querySelector('[routerLink="share-links"]')
+        .parentElement.classList
+    ).toContain('d-none')
+    expect(
+      fixture.nativeElement.querySelector('[routerLink="mail"]').parentElement
+        .classList
+    ).not.toContain('d-none')
+  })
+
+  it('should show hidden items and visibility switches while customizing', () => {
+    settingsService.set(SETTINGS_KEYS.SIDEBAR_HIDDEN_ITEMS, [
+      HideableSidebarItemID.Dashboard,
+    ])
+    settingsService.sidebarHiddenItemsEditing.set([
+      HideableSidebarItemID.Dashboard,
+    ])
+    fixture.detectChanges()
+
+    expect(
+      fixture.nativeElement.querySelectorAll('pngx-input-switch').length
+    ).toBe(6)
+    expect(
+      fixture.nativeElement.querySelector('[routerLink="dashboard"]')
+        .parentElement.classList
+    ).not.toContain('d-none')
+    expect(
+      fixture.nativeElement.querySelector('[routerLink="dashboard"]').classList
+    ).toContain('opacity-50')
+
+    settingsService.set(SETTINGS_KEYS.SLIM_SIDEBAR, true)
+    fixture.detectChanges()
+
+    expect(
+      Array.from(
+        fixture.nativeElement.querySelectorAll('pngx-input-switch')
+      ).every((toggle: HTMLElement) => toggle.classList.contains('d-none'))
+    ).toBe(true)
+    expect(
+      fixture.nativeElement.querySelector('[routerLink="dashboard"]').classList
+    ).not.toContain('pe-5')
+
+    settingsService.set(SETTINGS_KEYS.SLIM_SIDEBAR, false)
+    component.slimSidebarAnimating.set(true)
+    fixture.detectChanges()
+
+    expect(
+      Array.from(
+        fixture.nativeElement.querySelectorAll('pngx-input-switch')
+      ).every((toggle: HTMLElement) => toggle.classList.contains('d-none'))
+    ).toBe(true)
+
+    component.slimSidebarAnimating.set(false)
+    fixture.detectChanges()
+
+    expect(
+      Array.from(
+        fixture.nativeElement.querySelectorAll('pngx-input-switch')
+      ).every((toggle: HTMLElement) => !toggle.classList.contains('d-none'))
+    ).toBe(true)
+    expect(
+      fixture.nativeElement.querySelector('[routerLink="dashboard"]').classList
+    ).toContain('pe-5')
+  })
 
   it('should show error on toggle slim sidebar if store settings fails', () => {
     jest.spyOn(console, 'warn').mockImplementation(() => {})
@@ -291,9 +389,9 @@ describe('AppFrameComponent', () => {
       fixture.nativeElement as HTMLDivElement
     ).querySelector('button[data-toggle=collapse]')
     button.dispatchEvent(new MouseEvent('click'))
-    expect(component.isMenuCollapsed).toBeFalsy()
+    expect(component.isMenuCollapsed()).toBeFalsy()
     component.closeMenu()
-    expect(component.isMenuCollapsed).toBeTruthy()
+    expect(component.isMenuCollapsed()).toBeTruthy()
   })
 
   it('should hide mobile search when scrolling down and show it when scrolling up', () => {
@@ -308,14 +406,14 @@ describe('AppFrameComponent', () => {
       value: 40,
     })
     component.onWindowScroll()
-    expect(component.mobileSearchHidden).toBe(true)
+    expect(component.mobileSearchHidden()).toBe(true)
 
     Object.defineProperty(globalThis, 'scrollY', {
       configurable: true,
       value: 0,
     })
     component.onWindowScroll()
-    expect(component.mobileSearchHidden).toBe(false)
+    expect(component.mobileSearchHidden()).toBe(false)
   })
 
   it('should keep mobile search visible on desktop scroll or resize', () => {
@@ -323,13 +421,13 @@ describe('AppFrameComponent', () => {
       value: 1024,
     })
     component.ngOnInit()
-    component.mobileSearchHidden = true
+    component.mobileSearchHidden.set(true)
 
     component.onWindowScroll()
 
-    expect(component.mobileSearchHidden).toBe(false)
+    expect(component.mobileSearchHidden()).toBe(false)
 
-    component.mobileSearchHidden = true
+    component.mobileSearchHidden.set(true)
     component.onWindowResize()
   })
 
@@ -338,7 +436,7 @@ describe('AppFrameComponent', () => {
       value: 767,
     })
     component.ngOnInit()
-    component.isMenuCollapsed = false
+    component.isMenuCollapsed.set(false)
 
     Object.defineProperty(globalThis, 'scrollY', {
       configurable: true,
@@ -346,7 +444,7 @@ describe('AppFrameComponent', () => {
     })
     component.onWindowScroll()
 
-    expect(component.mobileSearchHidden).toBe(false)
+    expect(component.mobileSearchHidden()).toBe(false)
   })
 
   it('should support close document & navigate on close current doc', () => {
@@ -367,6 +465,45 @@ describe('AppFrameComponent', () => {
     expect(routerSpy).toHaveBeenCalled()
   })
 
+  it('should upload files selected from the navbar upload button', () => {
+    const uploadDocumentsService = TestBed.inject(UploadDocumentsService)
+    const uploadSpy = jest
+      .spyOn(uploadDocumentsService, 'uploadFiles')
+      .mockImplementation(() => {})
+    const toastSpy = jest.spyOn(toastService, 'showInfo')
+    const file = new File(['testing'], 'file.pdf')
+    const input = window.document.createElement('input')
+    jest.spyOn(input, 'files', 'get').mockReturnValue([file] as any)
+
+    component.onFileSelected({ target: input } as unknown as Event)
+    expect(toastSpy).not.toHaveBeenCalled()
+    expect(uploadSpy).toHaveBeenCalledWith([file])
+  })
+
+  it('should show in-progress uploads and expand the status tray', () => {
+    const websocketStatusService = TestBed.inject(WebsocketStatusService)
+    expect(component.uploadsInProgress).toEqual(0)
+    websocketStatusService.newFileUpload('file.pdf')
+    expect(component.uploadsInProgress).toEqual(1)
+
+    fixture.detectChanges()
+    const tray = fixture.debugElement.query(
+      By.directive(UploadStatusTrayComponent)
+    ).componentInstance as UploadStatusTrayComponent
+    tray.toggleCollapsed()
+    expect(tray.collapsed()).toBe(true)
+    component.showUploadStatus()
+    expect(tray.collapsed()).toBe(false)
+  })
+
+  it('should not upload when no files are selected from the navbar', () => {
+    const uploadDocumentsService = TestBed.inject(UploadDocumentsService)
+    const uploadSpy = jest.spyOn(uploadDocumentsService, 'uploadFiles')
+    const input = window.document.createElement('input')
+    component.onFileSelected({ target: input } as unknown as Event)
+    expect(uploadSpy).not.toHaveBeenCalled()
+  })
+
   it('should close all documents on logout', () => {
     const closeAllSpy = jest.spyOn(openDocumentsService, 'closeAll')
     component.onLogout()
@@ -379,16 +516,16 @@ describe('AppFrameComponent', () => {
   })
 
   it('should disable global dropzone on start drag + drop, re-enable after', () => {
-    expect(settingsService.globalDropzoneEnabled).toBeTruthy()
+    expect(settingsService.globalDropzoneEnabled()).toBeTruthy()
     component.onDragStart(null)
-    expect(settingsService.globalDropzoneEnabled).toBeFalsy()
+    expect(settingsService.globalDropzoneEnabled()).toBeFalsy()
     component.onDragEnd(null)
-    expect(settingsService.globalDropzoneEnabled).toBeTruthy()
+    expect(settingsService.globalDropzoneEnabled()).toBeTruthy()
   })
 
   it('should update saved view sorting on drag + drop, show info', () => {
     const settingsSpy = jest.spyOn(settingsService, 'updateSidebarViewsSort')
-    const toastSpy = jest.spyOn(toastService, 'showInfo')
+    const toastSpy = jest.spyOn(toastService, 'showSuccess')
     jest.spyOn(settingsService, 'storeSettings').mockReturnValue(of(true))
     component.onDrop({ previousIndex: 0, currentIndex: 1 } as CdkDragDrop<
       SavedView[]
@@ -430,6 +567,7 @@ describe('AppFrameComponent', () => {
 
   it('should show toasts for django messages', () => {
     const toastErrorSpy = jest.spyOn(toastService, 'showError')
+    const toastSuccessSpy = jest.spyOn(toastService, 'showSuccess')
     const toastInfoSpy = jest.spyOn(toastService, 'showInfo')
     jest.spyOn(messagesService, 'get').mockReturnValue([
       { level: DjangoMessageLevel.WARNING, message: 'Test warning' },
@@ -440,7 +578,8 @@ describe('AppFrameComponent', () => {
     ])
     component.ngOnInit()
     expect(toastErrorSpy).toHaveBeenCalledTimes(2)
-    expect(toastInfoSpy).toHaveBeenCalledTimes(3)
+    expect(toastSuccessSpy).toHaveBeenCalledTimes(1)
+    expect(toastInfoSpy).toHaveBeenCalledTimes(2)
   })
 
   it('should call maybeRefreshDocumentCounts after saved views reload', () => {
@@ -449,8 +588,8 @@ describe('AppFrameComponent', () => {
 
   it('should show tasks badge for needs-attention tasks', () => {
     jest
-      .spyOn(tasksService, 'needsAttentionTasks', 'get')
-      .mockReturnValue([{} as any, {} as any])
+      .spyOn(tasksService, 'needsAttentionTasksCount', 'get')
+      .mockReturnValue(2)
 
     fixture.detectChanges()
 
@@ -544,6 +683,27 @@ describe('AppFrameComponent', () => {
       SETTINGS_KEYS.ATTRIBUTES_SECTIONS_COLLAPSED,
       ['attributes']
     )
+  })
+
+  it('should only flag scrollbars that take up layout width', () => {
+    const offsetWidth = jest.spyOn(HTMLElement.prototype, 'offsetWidth', 'get')
+    jest.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(100)
+
+    offsetWidth.mockReturnValue(115)
+    component['detectClassicScrollbars']()
+    expect(
+      window.document.documentElement.classList.contains(
+        'pngx-classic-scrollbars'
+      )
+    ).toBeTruthy()
+
+    offsetWidth.mockReturnValue(100)
+    component['detectClassicScrollbars']()
+    expect(
+      window.document.documentElement.classList.contains(
+        'pngx-classic-scrollbars'
+      )
+    ).toBeFalsy()
   })
 
   it('should collapse attributes sections when enabling slim sidebar', () => {

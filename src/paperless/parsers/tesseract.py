@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.resources
 import logging
 import os
-import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -20,14 +19,14 @@ from documents.parsers import ParseError
 from documents.parsers import make_thumbnail_from_pdf
 from documents.utils import copy_file_with_basic_stats
 from documents.utils import maybe_override_pixel_limit
-from documents.utils import run_subprocess
+from documents.utils import remove_alpha_channel
 from paperless.config import OcrConfig
 from paperless.models import CleanChoices
 from paperless.models import ModeChoices
 from paperless.models import OutputTypeChoices
-from paperless.parsers.utils import PDF_TEXT_MIN_LENGTH
 from paperless.parsers.utils import extract_pdf_text
-from paperless.parsers.utils import is_tagged_pdf
+from paperless.parsers.utils import is_born_digital_text
+from paperless.parsers.utils import post_process_text
 from paperless.parsers.utils import read_file_handle_unicode_errors
 from paperless.version import __full_version_str__
 
@@ -144,8 +143,8 @@ class RasterisedDocumentParser:
     # Result accessors
     # ------------------------------------------------------------------
 
-    def get_text(self) -> str | None:
-        return self.text
+    def get_text(self) -> str:
+        return self.text or ""
 
     def get_date(self) -> datetime.datetime | None:
         return self.date
@@ -198,18 +197,7 @@ class RasterisedDocumentParser:
             return im.mode in ("RGBA", "LA")
 
     def remove_alpha(self, image_path: Path) -> Path:
-        no_alpha_image = Path(self.tempdir) / "image-no-alpha"
-        run_subprocess(
-            [
-                settings.CONVERT_BINARY,
-                "-alpha",
-                "off",
-                str(image_path),
-                str(no_alpha_image),
-            ],
-            logger=self.log,
-        )
-        return no_alpha_image
+        return remove_alpha_channel(image_path, Path(self.tempdir) / "image-no-alpha")
 
     def get_dpi(self, image: Path) -> int | None:
         try:
@@ -395,7 +383,11 @@ class RasterisedDocumentParser:
 
         plain_pdf_path = Path(self.tempdir) / "image_plain.pdf"
         try:
-            convert_kwargs: dict = {}
+            convert_kwargs: dict = {
+                # Ignore invalid EXIF orientation values (e.g. 0) instead of
+                # aborting the conversion; valid values are still applied
+                "rotation": img2pdf.Rotation.ifvalid,
+            }
             if self.settings.image_dpi is not None:
                 convert_kwargs["layout_fun"] = img2pdf.get_fixed_dpi_layout_fun(
                     (self.settings.image_dpi, self.settings.image_dpi),
@@ -510,8 +502,10 @@ class RasterisedDocumentParser:
 
         if mime_type == "application/pdf":
             text_original = self.extract_text(None, document_path)
-            original_has_text = is_tagged_pdf(document_path, log=self.log) or (
-                text_original is not None and len(text_original) > PDF_TEXT_MIN_LENGTH
+            original_has_text = is_born_digital_text(
+                text_original,
+                document_path,
+                log=self.log,
             )
         else:
             text_original = None
@@ -656,17 +650,3 @@ class RasterisedDocumentParser:
                     f"No text was found in {document_path}, the content will be empty.",
                 )
                 self.text = ""
-
-
-def post_process_text(text: str | None) -> str | None:
-    if not text:
-        return None
-
-    collapsed_spaces = re.sub(r"([^\S\r\n]+)", " ", text)
-    no_leading_whitespace = re.sub(r"([\n\r]+)([^\S\n\r]+)", "\\1", collapsed_spaces)
-    no_trailing_whitespace = re.sub(r"([^\S\n\r]+)$", "", no_leading_whitespace)
-
-    # TODO: this needs a rework
-    # replace \0 prevents issues with saving to postgres.
-    # text may contain \0 when this character is present in PDF files.
-    return no_trailing_whitespace.strip().replace("\0", " ")

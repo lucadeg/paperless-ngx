@@ -4,7 +4,7 @@ on:
     types: [opened]
 jobs:
   Anti-slop:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     permissions:
       contents: read
       issues: read
@@ -14,29 +14,30 @@ jobs:
         with:
           max-failures: 4
           failure-add-pr-labels: 'ai'
+          failure-pr-message: |
+            This pull request was automatically closed because it matched multiple low-quality or automated-PR signals.
           require-pr-template: true
+          optional-pr-template-sections: 'Checklist:'
+          blocked-source-branches: |
+            main
+          blocked-terms: |
+            ASLOP-PR-VERIFY
   pr-bot:
     name: Automated PR Bot
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
+    # Runs after Anti-slop so the welcome comment can see whether the PR was closed
+    # instead of racing it. Still runs if that job fails, so labeling is not lost.
+    needs: Anti-slop
+    if: ${{ !cancelled() }}
     permissions:
       contents: read
       pull-requests: write
     steps:
       - name: Label PR by file path or branch name
         # see .github/labeler.yml for the labeler config
-        uses: actions/labeler@634933edcd8ababfe52f92936142cc22ac488b1b # v6.0.1
+        uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Label by size
-        uses: Gascon1/pr-size-labeler@deff8ed00a76639a7c0f197525bafa3350ba4c36 # v1.3.0
-        with:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          xs_label: 'small-change'
-          xs_diff: '9'
-          s_label: 'non-trivial'
-          s_diff: '99999'
-          fail_if_xl: 'false'
-          excluded_files: /\.lock$/ /\.txt$/ ^src-ui/pnpm-lock\.yaml$ ^src-ui/messages\.xlf$ ^src/locale/en_US/LC_MESSAGES/django\.po$
       - name: Label by PR title
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
@@ -92,8 +93,25 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            const pr = context.payload.pull_request;
-            const user = pr.user.login;
+            const user = context.payload.pull_request.user.login;
+
+            // Re-read the PR: Anti-slop may have closed and labeled it after the webhook
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+
+            if (pr.state === 'closed') {
+              core.info('Skipping comment: PR is already closed');
+              return;
+            }
+
+            const labels = pr.labels.map((label) => (typeof label === 'string' ? label : label.name));
+            if (labels.includes('ai')) {
+              core.info('Skipping comment: PR is labeled ai');
+              return;
+            }
 
             const { data: members } = await github.rest.orgs.listMembers({
               org: 'paperless-ngx',

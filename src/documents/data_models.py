@@ -5,8 +5,16 @@ from pathlib import Path
 from typing import TypedDict
 
 import magic
-from guardian.shortcuts import get_groups_with_perms
-from guardian.shortcuts import get_users_with_perms
+
+
+class StoredBarcode(TypedDict):
+    """
+    A detected barcode as it is stored with a document
+    """
+
+    page: int  # 1-indexed
+    value: str
+    format: str  # a DocumentBarcode.Format value
 
 
 @dataclasses.dataclass
@@ -34,6 +42,8 @@ class DocumentMetadataOverrides:
     skip_asn_if_exists: bool = False
     version_label: str | None = None
     actor_id: int | None = None
+    remote_ocr: bool = False
+    barcodes: list[StoredBarcode] | None = None
 
     def update(self, other: "DocumentMetadataOverrides") -> "DocumentMetadataOverrides":
         """
@@ -57,6 +67,8 @@ class DocumentMetadataOverrides:
             self.actor_id = other.actor_id
         if other.skip_asn_if_exists:
             self.skip_asn_if_exists = True
+        if other.remote_ocr:
+            self.remote_ocr = True
         if other.version_label is not None:
             self.version_label = other.version_label
 
@@ -103,6 +115,9 @@ class DocumentMetadataOverrides:
         """
         Fills in the overrides from a document object
         """
+        # documents.models imports this module, so this can't be a top-level import
+        from documents.permissions import get_permission_grantees
+
         overrides = DocumentMetadataOverrides()
         overrides.title = doc.title
         overrides.correspondent_id = doc.correspondent.id if doc.correspondent else None
@@ -112,37 +127,15 @@ class DocumentMetadataOverrides:
         overrides.tag_ids = list(doc.tags.values_list("id", flat=True))
         overrides.created = doc.created
 
-        overrides.view_users = list(
-            get_users_with_perms(
-                doc,
-                only_with_perms_in=["view_document"],
-            ).values_list("id", flat=True),
-        )
-        overrides.change_users = list(
-            get_users_with_perms(
-                doc,
-                only_with_perms_in=["change_document"],
-            ).values_list("id", flat=True),
-        )
+        grantees = get_permission_grantees(type(doc), [doc.pk])[doc.pk]
+        overrides.view_users = grantees["view"]["users"]
+        overrides.view_groups = grantees["view"]["groups"]
+        overrides.change_users = grantees["change"]["users"]
+        overrides.change_groups = grantees["change"]["groups"]
         overrides.custom_fields = {
             custom_field.field.id: custom_field.value
             for custom_field in doc.custom_fields.all()
         }
-
-        groups_with_perms = get_groups_with_perms(
-            doc,
-            attach_perms=True,
-        )
-        overrides.view_groups = [
-            group.id
-            for group in groups_with_perms
-            if "view_document" in groups_with_perms[group]
-        ]
-        overrides.change_groups = [
-            group.id
-            for group in groups_with_perms
-            if "change_document" in groups_with_perms[group]
-        ]
 
         return overrides
 

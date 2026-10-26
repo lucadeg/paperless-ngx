@@ -7,7 +7,8 @@ from documents.data_models import DocumentMetadataOverrides
 from documents.models import CustomFieldInstance
 from documents.models import Document
 from documents.models import WorkflowAction
-from documents.permissions import set_permissions_for_object
+from documents.permissions import PermissionsSpec
+from documents.permissions import set_permissions_for_objects
 from documents.templating.workflows import parse_w_workflow_placeholders
 
 logger = logging.getLogger("paperless.workflows.mutations")
@@ -24,7 +25,11 @@ def apply_assignment_to_document(
     action: WorkflowAction, annotated with 'has_assign_*' boolean fields
     """
     if action.has_assign_tags:
-        document.add_nested_tags(action.assign_tags.all())
+        # Apply to a freshly-fetched instance rather than the shared `document`.
+        # Document.tags.add() fires an m2m_changed signal that ultimately calls
+        # instance.refresh_from_db(), which would discard any other unsaved
+        # assignment fields (e.g. storage_path) already staged on `document`.
+        Document.objects.get(pk=document.pk).add_nested_tags(action.assign_tags.all())
 
     if action.assign_correspondent:
         document.correspondent = action.assign_correspondent
@@ -40,7 +45,7 @@ def apply_assignment_to_document(
 
     if action.assign_title:
         try:
-            document.title = parse_w_workflow_placeholders(
+            title = parse_w_workflow_placeholders(
                 action.assign_title,
                 document.correspondent.name if document.correspondent else "",
                 document.document_type.name if document.document_type else "",
@@ -53,6 +58,8 @@ def apply_assignment_to_document(
                 "",  # no urls in titles
                 document.pk,
             )
+            if title:
+                document.title = title
         except Exception:  # pragma: no cover
             logger.exception(
                 f"Error occurred parsing title assignment '{action.assign_title}', falling back to original",
@@ -67,7 +74,7 @@ def apply_assignment_to_document(
             action.has_assign_change_groups,
         ],
     ):
-        permissions = {
+        permissions: PermissionsSpec = {
             "view": {
                 "users": action.assign_view_users.values_list("id", flat=True),
                 "groups": action.assign_view_groups.values_list("id", flat=True),
@@ -77,9 +84,10 @@ def apply_assignment_to_document(
                 "groups": action.assign_change_groups.values_list("id", flat=True),
             },
         }
-        set_permissions_for_object(
-            permissions=permissions,
-            object=document,
+        set_permissions_for_objects(
+            permissions,
+            Document,
+            [document.pk],
             merge=True,
         )
 
@@ -99,7 +107,8 @@ def apply_assignment_to_document(
                 field=field,
                 document=document,
             ).first()
-            if instance and args[value_field_name] is not None:
+            # empty string is indistinguishable from no value in the UI
+            if instance and args[value_field_name] not in (None, ""):
                 setattr(instance, value_field_name, args[value_field_name])
                 instance.save()
             elif not instance:
@@ -236,13 +245,14 @@ def apply_removal_to_document(
         document.owner = None
 
     if action.remove_all_permissions:
-        permissions = {
+        permissions: PermissionsSpec = {
             "view": {"users": [], "groups": []},
             "change": {"users": [], "groups": []},
         }
-        set_permissions_for_object(
-            permissions=permissions,
-            object=document,
+        set_permissions_for_objects(
+            permissions,
+            Document,
+            [document.pk],
             merge=False,
         )
 

@@ -4,13 +4,16 @@ from datetime import date
 from pathlib import Path
 from unittest import mock
 
+import pytest
 from django.test import TestCase
 from django.test import override_settings
 from faker import Faker
+from pytest_mock import MockerFixture
 
 from documents.models import Correspondent
 from documents.models import Document
 from documents.tasks import empty_trash
+from paperless_testing.factories import DocumentFactory
 
 
 class TestDocument(TestCase):
@@ -110,7 +113,7 @@ class TestDocument(TestCase):
             checksum="checksum",
             mime_type="application/pdf",
         )
-        Document.objects.create(
+        version = Document.objects.create(
             root_document=root,
             correspondent=root.correspondent,
             title="Version",
@@ -123,6 +126,10 @@ class TestDocument(TestCase):
 
         self.assertEqual(Document.objects.count(), 0)
         self.assertEqual(Document.deleted_objects.count(), 2)
+
+        root.restore(strict=False)
+
+        self.assertTrue(Document.objects.filter(pk=version.pk).exists())
 
     def test_file_name(self) -> None:
         doc = Document(
@@ -155,6 +162,40 @@ class TestDocument(TestCase):
             created=date(2020, 12, 25),
         )
         self.assertEqual(doc.get_public_filename(), "2020-12-25 test")
+
+    def test_version_file_name_uses_root_document_metadata(self) -> None:
+        root_correspondent = Correspondent.objects.create(name="Root correspondent")
+        version_correspondent = Correspondent.objects.create(
+            name="Version correspondent",
+        )
+        root = Document.objects.create(
+            mime_type="application/pdf",
+            title="Root title",
+            created=date(2020, 12, 25),
+            correspondent=root_correspondent,
+        )
+        version = Document.objects.create(
+            mime_type="application/pdf",
+            title="Version title",
+            created=date(1990, 1, 1),
+            correspondent=version_correspondent,
+            root_document=root,
+            version_index=1,
+        )
+
+        self.assertEqual(
+            version.get_public_filename(),
+            "2020-12-25 Root correspondent Root title.pdf",
+        )
+
+        root.title = "Updated root title"
+        root.save(update_fields=("title",))
+        version.refresh_from_db()
+
+        self.assertEqual(
+            version.get_public_filename(),
+            "2020-12-25 Root correspondent Updated root title.pdf",
+        )
 
     def test_suggestion_content_uses_latest_version_content_for_root_documents(
         self,
@@ -219,3 +260,72 @@ def test_suggestion_content() -> None:
     )
     doc.content = content_over_limit
     assert doc.suggestion_content == expected_cropped_content
+
+
+class TestPublicFilenameLength:
+    @pytest.fixture(autouse=True)
+    def _no_parser_registry(self, mocker: MockerFixture) -> None:
+        # The parser registry reads ApplicationConfiguration from the database
+        extensions = {"application/pdf": ".pdf", "image/jpeg": ".jpg"}
+        mocker.patch(
+            "documents.models.get_default_file_extension",
+            side_effect=extensions.__getitem__,
+        )
+
+    LIMIT = Document.MAX_PUBLIC_FILENAME_BYTES
+
+    @pytest.mark.parametrize(
+        ("title", "archive", "counter", "max_bytes", "tail"),
+        [
+            pytest.param("a" * 300, False, 0, LIMIT, ".jpg", id="ascii"),
+            pytest.param("a" * 300, True, 0, LIMIT, ".pdf", id="archive"),
+            pytest.param("ä" * 200, False, 0, LIMIT, ".jpg", id="umlaut"),
+            pytest.param("ä" * 200, False, 1, LIMIT, "_01.jpg", id="count"),
+            pytest.param("a" * 300, False, 1, 100, "_01.jpg", id="max"),
+        ],
+    )
+    def test_long_title_keeps_tail_within_limit(
+        self,
+        title: str,
+        *,
+        archive: bool,
+        counter: int,
+        max_bytes: int,
+        tail: str,
+    ) -> None:
+        """
+        GIVEN:
+            - A document whose title alone is longer than the byte limit
+        WHEN:
+            - The public file name is generated
+        THEN:
+            - The name ends with the counter and extension
+            - The name fits in the limit
+        """
+        name = DocumentFactory.build(
+            title=title,
+            mime_type="image/jpeg",
+        ).get_public_filename(
+            archive=archive,
+            counter=counter,
+            max_bytes=max_bytes,
+        )
+
+        assert name.endswith(tail)
+        assert len(name.encode()) <= max_bytes
+
+    def test_long_title_counters_give_distinct_names(self) -> None:
+        """
+        GIVEN:
+            - A document whose title alone is longer than the byte limit
+        WHEN:
+            - Public file names are generated with increasing counters
+        THEN:
+            - Each counter produces a distinct name
+        """
+        doc = DocumentFactory.build(title="ä" * 200, mime_type="application/pdf")
+
+        names = [doc.get_public_filename(counter=counter) for counter in range(3)]
+
+        assert len(set(names)) == 3
+        assert all(len(n.encode()) <= self.LIMIT for n in names)

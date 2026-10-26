@@ -12,10 +12,10 @@ physical documents into a searchable online archive so you can keep, well, _less
 [Get started](setup.md){ .md-button .md-button--primary .index-callout }
 [Demo](https://demo.paperless-ngx.com){ .md-button .md-button--secondary target=\_blank }
 
-<div style="display: flex; justify-content: end; margin-top: -1.5rem;">
-  <a href="https://m.do.co/c/8d70b916d462" target="_blank">
-    <img src="https://opensource.nyc3.cdn.digitaloceanspaces.com/attribution/assets/PoweredByDO/DO_Powered_by_Badge_white.svg#only-dark" class="no-lightbox" width="150px">
-    <img src="https://opensource.nyc3.cdn.digitaloceanspaces.com/attribution/assets/PoweredByDO/DO_Powered_by_Badge_black.svg#only-light" class="no-lightbox" width="150px">
+<div class="demo-sponsor">
+  <span>Demo hosting by</span>
+  <a href="https://fyrastack.com" target="_blank" rel="noopener">
+    <img src="assets/sponsors/fyra-stack.svg" alt="" class="no-lightbox" width="20" height="20"> Fyra Stack
   </a>
 </div>
 
@@ -35,9 +35,10 @@ physical documents into a searchable online archive so you can keep, well, _less
   - _New!_ Supports remote OCR with Azure AI (opt-in).
 - Documents are saved as PDF/A format which is designed for long term storage, alongside the unaltered originals.
 - Uses machine-learning to automatically add tags, correspondents and document types to your documents.
-- **New**: Paperless-ngx can now leverage AI (Large Language Models or LLMs) for document suggestions. This is an optional feature that can be enabled (and is disabled by default).
+- **New**: Paperless-ngx can optionally leverage AI (Large Language Models or LLMs) for document suggestions, chatting with your documents, and similar-document retrieval. These features are opt-in and disabled by default.
 - Supports PDF documents, images, plain text files, Office documents (Word, Excel, PowerPoint, and LibreOffice equivalents)[^1] and more.
 - Paperless stores your documents plain on disk. Filenames and folders are managed by paperless and their format can be configured freely with different configurations assigned to different documents.
+- Keep multiple **versions** of a document's file under a single entry, sharing one set of metadata.
 - **Beautiful, modern web application** that features:
   - Customizable dashboard with statistics.
   - Filtering by tags, correspondents, types, and more.

@@ -3,16 +3,26 @@ import logging
 import shutil
 from collections.abc import Callable
 from collections.abc import Iterable
+from collections.abc import Iterator
 from os import utime
 from pathlib import Path
 from subprocess import CompletedProcess
 from subprocess import run
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import Generic
 from typing import TypeVar
 
 from django.conf import settings
 from PIL import Image
+from PIL import ImageSequence
+
+if TYPE_CHECKING:
+    from django.db.models import Model
+    from django.db.models import QuerySet
 
 _T = TypeVar("_T")
+_M = TypeVar("_M", bound="Model")
 
 # A function that wraps an iterable — typically used to inject a progress bar.
 IterWrapper = Callable[[Iterable[_T]], Iterable[_T]]
@@ -21,6 +31,40 @@ IterWrapper = Callable[[Iterable[_T]], Iterable[_T]]
 def identity(iterable: Iterable[_T]) -> Iterable[_T]:
     """Return the iterable unchanged; the no-op default for IterWrapper."""
     return iterable
+
+
+class QuerySetStream(Generic[_M]):
+    """Stream a QuerySet via .iterator(chunk_size=...) instead of
+    materializing it (plus any prefetch caches) all at once, while still
+    supporting len() via count() so a progress bar wrapped around this
+    (e.g. via IterWrapper) shows a real total instead of falling back to
+    indeterminate.
+
+    Plain QuerySet iteration (``for row in queryset:``) is not lazy: Django
+    fetches every matching row in one query and caches the fully-hydrated
+    result in the queryset's own ``_result_cache`` before yielding the
+    first item -- wrapping that in a progress bar or any other iterable
+    adapter doesn't change this, since none of them alter how the
+    underlying queryset produces items. ``.iterator(chunk_size=...)`` is
+    the specific Django API that bypasses ``_result_cache`` and streams
+    from a server-side cursor instead, discarding each chunk once consumed
+    (and, since Django 4.1, still honours ``prefetch_related``, running the
+    prefetches one batch at a time rather than for the whole queryset).
+
+    Subclass to layer additional per-batch work on top (see
+    ``documents.search._backend._DocumentViewerStream``) by overriding
+    ``__iter__`` -- ``__len__`` and the constructor are inherited for free.
+    """
+
+    def __init__(self, queryset: "QuerySet[_M]", *, chunk_size: int) -> None:
+        self._queryset = queryset
+        self._chunk_size = chunk_size
+
+    def __len__(self) -> int:
+        return self._queryset.count()
+
+    def __iter__(self) -> Iterator[_M]:
+        return iter(self._queryset.iterator(chunk_size=self._chunk_size))
 
 
 def _coerce_to_path(
@@ -84,6 +128,32 @@ def maybe_override_pixel_limit() -> None:
         if pixel_count == 0:
             pixel_count = None
         Image.MAX_IMAGE_PIXELS = pixel_count
+
+
+def remove_alpha_channel(source: Path, dest: Path) -> Path:
+    """
+    Writes a copy of the image with its alpha channel dropped, keeping the
+    format, every frame, the DPI and any ICC profile.
+
+    The channel is dropped, not composited, so transparent pixels keep their
+    underlying color. Returns dest.
+    """
+    with Image.open(source) as im:
+        image_format = im.format
+        opaque_mode = "L" if im.mode == "LA" else "RGB"
+        frames = [frame.convert(opaque_mode) for frame in ImageSequence.Iterator(im)]
+        save_kwargs: dict[str, Any] = {}
+        if "dpi" in im.info:
+            save_kwargs["dpi"] = im.info["dpi"]
+        if "icc_profile" in im.info:
+            save_kwargs["icc_profile"] = im.info["icc_profile"]
+        if image_format == "WEBP":
+            save_kwargs["lossless"] = True
+        if len(frames) > 1:
+            save_kwargs["save_all"] = True
+            save_kwargs["append_images"] = frames[1:]
+    frames[0].save(dest, format=image_format, **save_kwargs)
+    return dest
 
 
 def run_subprocess(

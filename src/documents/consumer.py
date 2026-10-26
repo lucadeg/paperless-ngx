@@ -18,6 +18,7 @@ from django.utils import timezone
 from filelock import FileLock
 from rest_framework.reverse import reverse
 
+from documents.barcodes import read_barcode_values
 from documents.classifier import load_classifier
 from documents.data_models import ConsumableDocument
 from documents.data_models import ConsumeFileSuccessResult
@@ -25,17 +26,20 @@ from documents.data_models import DocumentMetadataOverrides
 from documents.file_handling import create_source_path_directory
 from documents.file_handling import generate_filename
 from documents.file_handling import generate_unique_filename
+from documents.file_handling import validate_path_in_root
 from documents.loggers import LoggingMixin
 from documents.models import Correspondent
 from documents.models import CustomField
 from documents.models import CustomFieldInstance
 from documents.models import Document
+from documents.models import DocumentBarcode
 from documents.models import DocumentType
 from documents.models import StoragePath
 from documents.models import Tag
 from documents.models import WorkflowTrigger
 from documents.parsers import ParseError
-from documents.permissions import set_permissions_for_object
+from documents.permissions import PermissionsSpec
+from documents.permissions import set_permissions_for_objects
 from documents.plugins.base import AlwaysRunPluginMixin
 from documents.plugins.base import ConsumeTaskPlugin
 from documents.plugins.base import NoCleanupPluginMixin
@@ -52,14 +56,14 @@ from documents.utils import compute_checksum
 from documents.utils import copy_basic_file_stats
 from documents.utils import copy_file_with_basic_stats
 from documents.utils import run_subprocess
+from paperless.config import BarcodeConfig
 from paperless.config import OcrConfig
+from paperless.config import RemoteOCRConfig
 from paperless.models import ArchiveFileGenerationChoices
 from paperless.parsers import ParserContext
 from paperless.parsers import ParserProtocol
 from paperless.parsers.registry import get_parser_registry
-from paperless.parsers.utils import PDF_TEXT_MIN_LENGTH
-from paperless.parsers.utils import extract_pdf_text
-from paperless.parsers.utils import is_tagged_pdf
+from paperless.parsers.utils import pdf_born_digital_text
 
 LOGGING_NAME: Final[str] = "paperless.consumer"
 
@@ -138,52 +142,45 @@ def should_produce_archive(
 
     # Must produce a PDF so the frontend can display the original format at all.
     if parser.requires_pdf_rendition:
-        _log.debug("Archive: yes — parser requires PDF rendition for frontend display")
+        _log.debug("Archive: yes - parser requires PDF rendition for frontend display")
         return True
 
     # Parser cannot produce an archive (e.g. TextDocumentParser).
     if not parser.can_produce_archive:
-        _log.debug("Archive: no — parser cannot produce archives")
+        _log.debug("Archive: no - parser cannot produce archives")
         return False
 
     generation = OcrConfig().archive_file_generation
 
     if generation == ArchiveFileGenerationChoices.ALWAYS:
-        _log.debug("Archive: yes — ARCHIVE_FILE_GENERATION=always")
+        _log.debug("Archive: yes - ARCHIVE_FILE_GENERATION=always")
         return True
     if generation == ArchiveFileGenerationChoices.NEVER:
-        _log.debug("Archive: no — ARCHIVE_FILE_GENERATION=never")
+        _log.debug("Archive: no - ARCHIVE_FILE_GENERATION=never")
         return False
 
     # auto: produce archives for scanned/image documents; skip for born-digital PDFs.
     if mime_type.startswith("image/"):
-        _log.debug("Archive: yes — image document, ARCHIVE_FILE_GENERATION=auto")
+        _log.debug("Archive: yes - image document, ARCHIVE_FILE_GENERATION=auto")
         return True
     if mime_type == "application/pdf":
-        if is_tagged_pdf(document_path):
+        text, born_digital = pdf_born_digital_text(document_path, log=_log)
+        text_length = len(text) if text else 0
+        if born_digital:
             _log.debug(
-                "Archive: no — born-digital PDF (structure tags detected),"
+                "Archive: no - born-digital PDF (text_length=%d),"
                 " ARCHIVE_FILE_GENERATION=auto",
+                text_length,
             )
             return False
-        text = extract_pdf_text(document_path)
-        if text is None or len(text) <= PDF_TEXT_MIN_LENGTH:
-            _log.debug(
-                "Archive: yes — scanned PDF (text_length=%d ≤ %d),"
-                " ARCHIVE_FILE_GENERATION=auto",
-                len(text) if text else 0,
-                PDF_TEXT_MIN_LENGTH,
-            )
-            return True
         _log.debug(
-            "Archive: no — born-digital PDF (text_length=%d > %d),"
+            "Archive: yes - scanned/textless PDF (text_length=%d),"
             " ARCHIVE_FILE_GENERATION=auto",
-            len(text),
-            PDF_TEXT_MIN_LENGTH,
+            text_length,
         )
-        return False
+        return True
     _log.debug(
-        "Archive: no — MIME type %r not eligible for auto archive generation",
+        "Archive: no - MIME type %r not eligible for auto archive generation",
         mime_type,
     )
     return False
@@ -460,18 +457,35 @@ class ConsumerPlugin(
                 except Exception as e:
                     self.log.error(f"Error attempting to clean PDF: {e}")
 
+            # Workflows have already run at this point, so the metadata knows
+            # whether this document was singled out for remote OCR
+            allow_remote = (
+                self.metadata.remote_ocr or RemoteOCRConfig().remote_ocr_by_default
+            )
+
             # Based on the mime type, get the parser for that type
             parser_class: type[ParserProtocol] | None = (
                 get_parser_registry().get_parser_for_file(
                     mime_type,
                     self.filename,
                     self.working_copy,
+                    allow_remote=allow_remote,
                 )
             )
             if not parser_class:
                 self._fail(
                     ConsumerStatusShortMessage.UNSUPPORTED_TYPE,
                     f"Unsupported mime type {mime_type}",
+                )
+
+            if self.metadata.remote_ocr and not getattr(
+                parser_class,
+                "uses_remote_service",
+                False,
+            ):
+                self.log.warning(
+                    "Remote OCR was requested for this document but no remote "
+                    "parser is available for it, processing locally instead.",
                 )
 
             # Notify all listeners that we're going to do some work.
@@ -493,6 +507,13 @@ class ConsumerPlugin(
                 self.log.debug(
                     f"Parser: {document_parser.name} v{document_parser.version}",
                 )
+
+                # New versions skip the barcode plugin, so read their barcodes here
+                if (
+                    self.input_doc.root_document_id is not None
+                    and self.metadata.barcodes is None
+                ):
+                    self._read_version_barcodes(mime_type, Path(tmpdir))
 
                 # Parse the document. This may take some time.
 
@@ -621,6 +642,13 @@ class ConsumerPlugin(
                             else:
                                 original_document.save()
 
+                            self._store_barcodes(original_document)
+
+                            # Adding a version changes the effective document, so update root modified
+                            Document.objects.filter(pk=root_doc.pk).update(
+                                modified=timezone.now(),
+                            )
+
                             # Create a log entry for the version addition, if enabled
                             if settings.AUDIT_LOG_ENABLED:
                                 from auditlog.models import (  # type: ignore[import-untyped]
@@ -681,6 +709,10 @@ class ConsumerPlugin(
                                     use_format=False,
                                 )
                             document.filename = generated_filename
+                            validate_path_in_root(
+                                document.source_path,
+                                settings.ORIGINALS_DIR,
+                            )
                             create_source_path_directory(document.source_path)
 
                             self._write(
@@ -713,6 +745,10 @@ class ConsumerPlugin(
                                         use_format=False,
                                     )
                                 document.archive_filename = generated_archive_filename
+                                validate_path_in_root(
+                                    document.archive_path,
+                                    settings.ARCHIVE_DIR,
+                                )
                                 create_source_path_directory(document.archive_path)
                                 self._write(
                                     archive_path,
@@ -732,6 +768,7 @@ class ConsumerPlugin(
                             document_updated.send(
                                 sender=self.__class__,
                                 document=document.root_document,
+                                skip_ai_index=True,  # document_consumption_finished already enqueues the LLM update
                             )
 
                         # Delete the file only if it was successfully consumed
@@ -833,8 +870,9 @@ class ConsumerPlugin(
             self.log.debug(f"Creation date from parse_date: {create_date}")
         else:
             stats = Path(self.input_doc.original_file).stat()
-            create_date = timezone.make_aware(
-                datetime.datetime.fromtimestamp(stats.st_mtime),
+            create_date = datetime.datetime.fromtimestamp(
+                stats.st_mtime,
+                tz=timezone.get_current_timezone(),
             )
             self.log.debug(f"Creation date from st_mtime: {create_date}")
 
@@ -911,7 +949,7 @@ class ConsumerPlugin(
             or self.metadata.change_users is not None
             or self.metadata.change_groups is not None
         ):
-            permissions = {
+            permissions: PermissionsSpec = {
                 "view": {
                     "users": self.metadata.view_users or [],
                     "groups": self.metadata.view_groups or [],
@@ -921,7 +959,7 @@ class ConsumerPlugin(
                     "groups": self.metadata.change_groups or [],
                 },
             }
-            set_permissions_for_object(permissions=permissions, object=document)
+            set_permissions_for_objects(permissions, Document, [document.pk])
 
         if self.metadata.custom_fields:
             for field in CustomField.objects.filter(
@@ -936,6 +974,32 @@ class ConsumerPlugin(
                     value_field_name: self.metadata.custom_fields.get(field.id, None),
                 }
                 CustomFieldInstance.objects.create(**args)  # adds to document
+
+        self._store_barcodes(document)
+
+    def _read_version_barcodes(self, mime_type: str, work_dir: Path) -> None:
+        barcode_settings = BarcodeConfig()
+        if not barcode_settings.barcode_store_values:
+            return
+        try:
+            self.metadata.barcodes = (
+                read_barcode_values(
+                    self.working_copy,
+                    mime_type,
+                    barcode_settings,
+                    work_dir,
+                )
+                or None
+            )
+        except Exception as e:
+            self.log.warning(f"Could not read barcodes of {self.filename}: {e}")
+
+    def _store_barcodes(self, document: Document) -> None:
+        if self.metadata.barcodes:
+            DocumentBarcode.objects.bulk_create(
+                DocumentBarcode(document=document, **barcode)
+                for barcode in self.metadata.barcodes
+            )
 
     def _write(self, source, target) -> None:
         with (

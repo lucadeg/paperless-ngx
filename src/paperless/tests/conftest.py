@@ -22,11 +22,11 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture(scope="session")
-def samples_dir() -> Path:
+def parser_samples_dir() -> Path:
     """Absolute path to the shared parser sample files directory.
 
     Sub-package conftest files derive format-specific paths from this root,
-    e.g. ``samples_dir / "text" / "test.txt"``.
+    e.g. ``parser_samples_dir / "text" / "test.txt"``.
 
     Returns
     -------
@@ -34,6 +34,23 @@ def samples_dir() -> Path:
         Directory containing all sample documents used by parser tests.
     """
     return (Path(__file__).parent / "samples").resolve()
+
+
+@pytest.fixture(scope="session")
+def tagged_no_text_pdf_file(parser_samples_dir: Path) -> Path:
+    """Path to a tagged PDF whose only "text" is pdftotext layout padding.
+
+    Reproduces GH #13387: ``/MarkInfo /Marked true`` is set, but the only
+    extractable content is a form-feed byte, not real text. Lives here
+    rather than in parsers/conftest.py so both parser tests and
+    paperless/tests/test_parser_utils.py can use it.
+
+    Returns
+    -------
+    Path
+        Absolute path to ``tesseract/tagged-but-no-text.pdf``.
+    """
+    return parser_samples_dir / "tesseract" / "tagged-but-no-text.pdf"
 
 
 @pytest.fixture(autouse=True)

@@ -7,7 +7,7 @@ import httpx
 import pytest
 from django.test.html import parse_html
 from django.utils import timezone
-from pytest_django.fixtures import SettingsWrapper
+from pytest_django.fixtures import Settings
 from pytest_httpx import HTTPXMock
 from pytest_mock import MockerFixture
 
@@ -144,6 +144,41 @@ class TestEmailFileParsing:
         assert parsed_msg.subject == "Simple Text Mail"
         assert parsed_msg.text == "This is just a simple Text Mail.\n"
         assert parsed_msg.to == ("some@one.de",)
+
+    def test_parse_file_to_message_makes_naive_date_aware(
+        self,
+        mocker: MockerFixture,
+        mail_parser: MailDocumentParser,
+        simple_txt_email_file: Path,
+    ) -> None:
+        """
+        GIVEN:
+            - An email whose parsed date is naive (no tzinfo)
+        WHEN:
+            - The .eml file is parsed into a MailMessage
+        THEN:
+            - The resulting message date is made timezone-aware
+        """
+        mock_message = mocker.Mock(
+            from_values="mail@someserver.de",
+            date=datetime.datetime(2022, 10, 12, 21, 40, 43),
+        )
+        mocker.patch(
+            "paperless.parsers.mail.MailMessage.from_bytes",
+            return_value=mock_message,
+        )
+
+        parsed_msg = mail_parser.parse_file_to_message(simple_txt_email_file)
+
+        assert timezone.is_aware(parsed_msg.date)
+        assert parsed_msg.date.replace(tzinfo=None) == datetime.datetime(
+            2022,
+            10,
+            12,
+            21,
+            40,
+            43,
+        )
 
 
 class TestEmailMetadataExtraction:
@@ -393,7 +428,7 @@ class TestTikaHtmlParse:
 
     def test_tika_parse_unreachable(
         self,
-        settings: SettingsWrapper,
+        settings: Settings,
         mail_parser: MailDocumentParser,
     ) -> None:
         """
@@ -699,6 +734,25 @@ class TestParser:
             actual_html = parse_html(html_file.read_text())
 
             assert expected_html == actual_html
+
+    def test_mail_to_html_linkifies_email_in_long_text(
+        self,
+        mail_parser: MailDocumentParser,
+    ) -> None:
+        mail = mock.Mock(
+            subject="",
+            from_values=None,
+            to_values=[],
+            cc_values=[],
+            bcc_values=[],
+            attachments=[],
+            date=timezone.now(),
+            text=("a." * 1500) + " sender@example.com",
+        )
+
+        html_file = mail_parser.mail_to_html(mail)
+
+        assert 'href="mailto:sender@example.com"' in html_file.read_text()
 
     def test_generate_pdf_from_mail(
         self,

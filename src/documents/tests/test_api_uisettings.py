@@ -1,13 +1,13 @@
 import json
 
 from django.contrib.auth.models import Permission
-from django.contrib.auth.models import User
 from django.test import override_settings
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from documents.tests.utils import DirectoriesMixin
 from paperless.version import __full_version_str__
+from paperless_testing.dirs import DirectoriesMixin
+from paperless_testing.factories import UserFactory
 
 
 class TestApiUiSettings(DirectoriesMixin, APITestCase):
@@ -15,7 +15,7 @@ class TestApiUiSettings(DirectoriesMixin, APITestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.test_user = User.objects.create_superuser(username="test")
+        self.test_user = UserFactory(username="test", superuser=True)
         self.test_user.first_name = "Test"
         self.test_user.last_name = "User"
         self.test_user.save()
@@ -60,6 +60,10 @@ class TestApiUiSettings(DirectoriesMixin, APITestCase):
                 },
                 "email_enabled": False,
                 "ai_enabled": False,
+                "remote_ocr": {
+                    "configured": False,
+                    "mode": "always",
+                },
             },
         )
 
@@ -87,7 +91,7 @@ class TestApiUiSettings(DirectoriesMixin, APITestCase):
         )
 
     def test_api_set_ui_settings_insufficient_global_permissions(self) -> None:
-        not_superuser = User.objects.create_user(username="test_not_superuser")
+        not_superuser = UserFactory(username="test_not_superuser")
         self.client.force_authenticate(user=not_superuser)
 
         settings = {
@@ -107,7 +111,7 @@ class TestApiUiSettings(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_api_set_ui_settings_sufficient_global_permissions(self) -> None:
-        not_superuser = User.objects.create_user(username="test_not_superuser")
+        not_superuser = UserFactory(username="test_not_superuser")
         not_superuser.user_permissions.add(
             *Permission.objects.filter(codename__contains="uisettings"),
         )
@@ -153,6 +157,50 @@ class TestApiUiSettings(DirectoriesMixin, APITestCase):
             "Expected a dictionary",
             str(response.data["settings"]),
         )
+
+    @override_settings(
+        REMOTE_OCR_ENGINE="azureai",
+        REMOTE_OCR_API_KEY="somekey",
+        REMOTE_OCR_ENDPOINT="https://example.cognitiveservices.azure.com",
+        REMOTE_OCR_MODE="workflow_only",
+    )
+    def test_settings_reports_remote_ocr_when_configured(self) -> None:
+        """
+        GIVEN:
+            - A fully configured remote OCR engine in workflow_only mode
+        WHEN:
+            - The ui_settings endpoint is called
+        THEN:
+            - The UI is told remote OCR is available and selective, so it can
+              offer it where it would actually change something
+        """
+        response = self.client.get(self.ENDPOINT, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["settings"]["remote_ocr"],
+            {"configured": True, "mode": "workflow_only"},
+        )
+
+    @override_settings(
+        REMOTE_OCR_ENGINE="azureai",
+        REMOTE_OCR_API_KEY=None,
+        REMOTE_OCR_ENDPOINT=None,
+    )
+    def test_settings_reports_remote_ocr_incompletely_configured(self) -> None:
+        """
+        GIVEN:
+            - An engine named but missing its endpoint and API key
+        WHEN:
+            - The ui_settings endpoint is called
+        THEN:
+            - It is reported as not configured, matching what the parser
+              registry will actually do
+        """
+        response = self.client.get(self.ENDPOINT, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["settings"]["remote_ocr"]["configured"])
 
     @override_settings(
         OAUTH_CALLBACK_BASE_URL="http://localhost:8000",

@@ -30,7 +30,7 @@ RUN set -eux \
 # Purpose: Installs s6-overlay and rootfs
 # Comments:
 #  - Don't leave anything extra in here either
-FROM ghcr.io/astral-sh/uv:0.11.6-python3.12-trixie-slim AS s6-overlay-base
+FROM ghcr.io/astral-sh/uv:0.13.5-python3.14-trixie-slim@sha256:d8e732839dfc4225a1ff698803b478b2223c05636c055d3add41ab9dbec0f315 AS s6-overlay-base
 
 WORKDIR /usr/src/s6
 
@@ -129,7 +129,6 @@ ARG RUNTIME_PACKAGES="\
   ghostscript \
   gnupg \
   icc-profiles-free \
-  imagemagick \
   # PostgreSQL
   postgresql-client \
   # MySQL / MariaDB
@@ -167,11 +166,11 @@ RUN set -eux \
         https://github.com/paperless-ngx/builder/releases/download/jbig2enc-trixie-v${JBIG2ENC_VERSION}/jbig2enc_${JBIG2ENC_VERSION}-1_${TARGETARCH}.deb \
       && echo "Installing jbig2enc" \
         && dpkg --install ./jbig2enc_${JBIG2ENC_VERSION}-1_${TARGETARCH}.deb \
-      && echo "Configuring imagemagick" \
-        && cp /etc/ImageMagick-6/paperless-policy.xml /etc/ImageMagick-6/policy.xml \
       && echo "Cleaning up image layer" \
         && rm --force --verbose *.deb \
-    && rm --recursive --force --verbose /var/lib/apt/lists/*
+    && rm --recursive --force --verbose /var/lib/apt/lists/* \
+    && echo "Configuring interactive shells to source the s6 container environment" \
+      && echo '. /etc/profile.d/contenv.sh' >> /etc/bash.bashrc
 
 WORKDIR /usr/src/paperless/src/
 
@@ -199,10 +198,6 @@ RUN set -eux \
       --index https://download.pytorch.org/whl/cpu \
       --index-strategy unsafe-best-match \
       --requirements requirements.txt \
-  && echo "Installing NLTK data" \
-    && python3 -W ignore::RuntimeWarning -m nltk.downloader -d "/usr/share/nltk_data" snowball_data \
-    && python3 -W ignore::RuntimeWarning -m nltk.downloader -d "/usr/share/nltk_data" stopwords \
-    && python3 -W ignore::RuntimeWarning -m nltk.downloader -d "/usr/share/nltk_data" punkt_tab \
   && echo "Cleaning up image" \
     && apt-get --yes purge ${BUILD_PACKAGES} \
     && apt-get --yes autoremove --purge \
@@ -236,6 +231,12 @@ RUN set -eux \
     && mkdir -m700 --verbose /usr/src/paperless/.gnupg \
   && echo "Adjusting all permissions" \
     && chown --from root:root --changes --recursive paperless:paperless /usr/src/paperless \
+  && echo "Making fontconfig cache writable for arbitrary container UIDs" \
+    && chmod 1777 /var/cache/fontconfig \
+  && echo "Making /run world-writable for rootless operation" \
+    && chmod 1777 /run \
+  && echo "Removing setuid from s6-overlay-suexec for rootless compat" \
+    && chmod u-s /command/s6-overlay-suexec \
   && echo "Collecting static files" \
     && PAPERLESS_SECRET_KEY=build-time-dummy s6-setuidgid paperless python3 manage.py collectstatic --clear --no-input --link \
     && PAPERLESS_SECRET_KEY=build-time-dummy s6-setuidgid paperless python3 manage.py compilemessages \

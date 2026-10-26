@@ -1,5 +1,5 @@
 import { JsonPipe, NgTemplateOutlet } from '@angular/common'
-import { Component, inject, OnDestroy, OnInit } from '@angular/core'
+import { Component, inject, OnDestroy, OnInit, signal } from '@angular/core'
 import { FormsModule, ReactiveFormsModule } from '@angular/forms'
 import { Router, RouterLink } from '@angular/router'
 import {
@@ -15,6 +15,9 @@ import {
   distinctUntilChanged,
   filter,
   first,
+  forkJoin,
+  map,
+  Observable,
   Subject,
   takeUntil,
   timer,
@@ -25,6 +28,7 @@ import {
   PaperlessTaskTriggerSource,
   PaperlessTaskType,
 } from 'src/app/data/paperless-task'
+import { Results } from 'src/app/data/results'
 import { IfPermissionsDirective } from 'src/app/directives/if-permissions.directive'
 import { CustomDatePipe } from 'src/app/pipes/custom-date.pipe'
 import { TasksService } from 'src/app/services/tasks.service'
@@ -40,7 +44,7 @@ export enum TaskSection {
   Completed = 'completed',
 }
 
-enum TaskFilterTargetID {
+export enum TaskFilterTargetID {
   Name,
   Result,
 }
@@ -98,6 +102,10 @@ const TASK_TYPE_OPTIONS: Array<{
   {
     value: PaperlessTaskType.BulkDelete,
     label: $localize`Bulk Delete`,
+  },
+  {
+    value: PaperlessTaskType.ApplyAiSuggestions,
+    label: $localize`Apply AI Suggestions`,
   },
 ]
 
@@ -165,9 +173,16 @@ export class TasksComponent
   public expandedTask: number
   public autoRefreshEnabled: boolean = true
   public readonly pageSize = 25
+  public readonly overviewSize = 10
   public page: number = 1
-  public totalTasks: number = 0
-  public pagedTasks: PaperlessTask[] = []
+  readonly totalTasks = signal(0)
+  readonly sectionCounts = signal<Record<TaskSection, number>>({
+    [TaskSection.All]: 0,
+    [TaskSection.NeedsAttention]: 0,
+    [TaskSection.InProgress]: 0,
+    [TaskSection.Completed]: 0,
+  })
+  readonly pagedTasks = signal<PaperlessTask[]>([])
   public selectedSection: TaskSection = TaskSection.All
   public selectedTaskType: PaperlessTaskType | null = null
   public selectedTriggerSource: PaperlessTaskTriggerSource | null = null
@@ -282,6 +297,7 @@ export class TasksComponent
       .subscribe((query) => {
         this._filterText = query
         this.clearSelection()
+        this.reloadPage(true)
       })
   }
 
@@ -309,7 +325,7 @@ export class TasksComponent
       modal.componentInstance.btnClass = 'btn-warning'
       modal.componentInstance.btnCaption = $localize`Dismiss`
       modal.componentInstance.confirmClicked.pipe(first()).subscribe(() => {
-        modal.componentInstance.buttonsEnabled = false
+        modal.componentInstance.buttonsEnabled.set(false)
         modal.close()
         this.tasksService.dismissTasks(tasks).subscribe({
           next: () => {
@@ -317,7 +333,7 @@ export class TasksComponent
           },
           error: (e) => {
             this.toastService.showError($localize`Error dismissing tasks`, e)
-            modal.componentInstance.buttonsEnabled = true
+            modal.componentInstance.buttonsEnabled.set(true)
           },
         })
         this.clearSelection()
@@ -332,6 +348,30 @@ export class TasksComponent
       })
       this.clearSelection()
     }
+  }
+
+  dismissAllTasks() {
+    let modal = this.modalService.open(ConfirmDialogComponent, {
+      backdrop: 'static',
+    })
+    modal.componentInstance.title = $localize`Confirm Dismiss All`
+    modal.componentInstance.messageBold = $localize`Dismiss all ${this.totalTasks()} tasks?`
+    modal.componentInstance.btnClass = 'btn-warning'
+    modal.componentInstance.btnCaption = $localize`Dismiss`
+    modal.componentInstance.confirmClicked.pipe(first()).subscribe(() => {
+      modal.componentInstance.buttonsEnabled.set(false)
+      modal.close()
+      this.tasksService.dismissAllTasks().subscribe({
+        next: () => {
+          this.reloadPage(false)
+        },
+        error: (e) => {
+          this.toastService.showError($localize`Error dismissing tasks`, e)
+          modal.componentInstance.buttonsEnabled.set(true)
+        },
+      })
+      this.clearSelection()
+    })
   }
 
   expandTask(task: PaperlessTask) {
@@ -434,7 +474,7 @@ export class TasksComponent
   }
 
   tasksForSection(section: TaskSection): PaperlessTask[] {
-    let tasks = this.pagedTasks.filter((task) =>
+    let tasks = this.pagedTasks().filter((task) =>
       this.taskBelongsToSection(task, section)
     )
 
@@ -446,9 +486,7 @@ export class TasksComponent
   }
 
   sectionCount(section: TaskSection): number {
-    return this.pagedTasks.filter((task) =>
-      this.taskBelongsToSection(task, section)
-    ).length
+    return this.sectionCounts()[section]
   }
 
   sectionShowsResults(section: TaskSection): boolean {
@@ -458,16 +496,27 @@ export class TasksComponent
   setSection(section: TaskSection) {
     this.selectedSection = section
     this.clearSelection()
+    this.reloadPage(true)
   }
 
   setTaskType(taskType: PaperlessTaskType | null) {
     this.selectedTaskType = taskType
     this.clearSelection()
+    this.reloadPage(true)
   }
 
   setTriggerSource(triggerSource: PaperlessTaskTriggerSource | null) {
     this.selectedTriggerSource = triggerSource
     this.clearSelection()
+    this.reloadPage(true)
+  }
+
+  setFilterTarget(filterTargetID: TaskFilterTargetID) {
+    this.filterTargetID = filterTargetID
+    if (this._filterText.length) {
+      this.clearSelection()
+      this.reloadPage(true)
+    }
   }
 
   taskTypeOptionCount(taskType: PaperlessTaskType | null): number {
@@ -505,19 +554,32 @@ export class TasksComponent
   }
 
   public resetFilter() {
+    if (!this._filterText.length) {
+      return
+    }
+
     this._filterText = ''
+    this.clearSelection()
+    this.reloadPage(true)
   }
 
   public resetFilters() {
+    const hadFilter = this.isFiltered
     this.selectedTaskType = null
     this.selectedTriggerSource = null
-    this.resetFilter()
+    this._filterText = ''
     this.clearSelection()
+
+    if (hadFilter) {
+      this.reloadPage(true)
+    }
   }
 
   filterInputKeyup(event: KeyboardEvent) {
     if (event.key == 'Enter') {
       this._filterText = (event.target as HTMLInputElement).value
+      this.clearSelection()
+      this.reloadPage(true)
     } else if (event.key === 'Escape') {
       this.resetFilter()
     }
@@ -599,11 +661,70 @@ export class TasksComponent
         ? this.sections
         : [this.selectedSection]
 
-    return this.pagedTasks.filter(
+    return this.pagedTasks().filter(
       (task) =>
         sections.some((section) => this.taskBelongsToSection(task, section)) &&
         this.taskMatchesFilters(task, { taskType, triggerSource })
     )
+  }
+
+  private reloadSectionCounts() {
+    this.tasksService
+      .statusCounts(this.getParamsForSection(TaskSection.All))
+      .pipe(first(), takeUntil(this.unsubscribeNotifier))
+      .subscribe((counts) => {
+        this.sectionCounts.set({
+          [TaskSection.All]: counts.all,
+          [TaskSection.NeedsAttention]: counts.needs_attention,
+          [TaskSection.InProgress]: counts.in_progress,
+          [TaskSection.Completed]: counts.completed,
+        })
+      })
+  }
+
+  private getParamsForSection(
+    section: TaskSection
+  ): Record<string, string | number | boolean | readonly string[]> {
+    const params: Record<
+      string,
+      string | number | boolean | readonly string[]
+    > = {
+      acknowledged: false,
+    }
+
+    const statuses = this.statusesForSection(section)
+    if (statuses.length) {
+      params.status = statuses
+    }
+
+    if (this.selectedTaskType !== null) {
+      params.task_type = this.selectedTaskType
+    }
+
+    if (this.selectedTriggerSource !== null) {
+      params.trigger_source = this.selectedTriggerSource
+    }
+
+    if (this._filterText.length) {
+      params[
+        this.filterTargetID === TaskFilterTargetID.Name ? 'name' : 'result'
+      ] = this._filterText
+    }
+
+    return params
+  }
+
+  private statusesForSection(section: TaskSection): PaperlessTaskStatus[] {
+    switch (section) {
+      case TaskSection.NeedsAttention:
+        return [PaperlessTaskStatus.Failure, PaperlessTaskStatus.Revoked]
+      case TaskSection.InProgress:
+        return [PaperlessTaskStatus.Pending, PaperlessTaskStatus.Started]
+      case TaskSection.Completed:
+        return [PaperlessTaskStatus.Success]
+      default:
+        return []
+    }
   }
 
   private reloadPage(resetToFirstPage: boolean = false) {
@@ -611,27 +732,54 @@ export class TasksComponent
       this.page = 1
     }
 
-    this.loading = true
-    this.tasksService
-      .list(this.page, this.pageSize, { acknowledged: false })
+    this.reloadSectionCounts()
+
+    this.loading.set(true)
+    this.listTasks()
       .pipe(first(), takeUntil(this.unsubscribeNotifier))
       .subscribe({
         next: (result) => {
-          this.pagedTasks = result.results
-          this.totalTasks = result.count
-          this.loading = false
+          this.pagedTasks.set(result.results)
+          this.totalTasks.set(result.count)
+          this.loading.set(false)
           if (
             this.page > 1 &&
-            this.pagedTasks.length === 0 &&
-            this.totalTasks > 0
+            this.pagedTasks().length === 0 &&
+            this.totalTasks() > 0
           ) {
             this.page -= 1
             this.reloadPage()
           }
         },
         error: () => {
-          this.loading = false
+          this.loading.set(false)
         },
       })
+  }
+
+  private listTasks(): Observable<Results<PaperlessTask>> {
+    if (this.selectedSection !== TaskSection.All) {
+      return this.tasksService.list(
+        this.page,
+        this.pageSize,
+        this.getParamsForSection(this.selectedSection)
+      )
+    }
+
+    // All is an overview of each section to avoid splitting sections across pages
+    return forkJoin(
+      this.sections.map((section) =>
+        this.tasksService.list(
+          1,
+          this.overviewSize,
+          this.getParamsForSection(section)
+        )
+      )
+    ).pipe(
+      map((results) => ({
+        count: results.reduce((sum, result) => sum + result.count, 0),
+        results: results.flatMap((result) => result.results),
+      }))
+    )
   }
 }

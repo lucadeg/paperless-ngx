@@ -258,32 +258,52 @@ def get_list_from_env(
         return []
 
 
+@overload
+def get_choice_from_env(
+    env_key: str,
+    choices: set[str] | frozenset[str],
+) -> str | None: ...
+
+
+@overload
+def get_choice_from_env(
+    env_key: str,
+    choices: set[str] | frozenset[str],
+    default: None,
+) -> str | None: ...
+
+
+@overload
+def get_choice_from_env(
+    env_key: str,
+    choices: set[str] | frozenset[str],
+    default: str,
+) -> str: ...
+
+
 def get_choice_from_env(
     env_key: str,
     choices: set[str] | frozenset[str],
     default: str | None = None,
-) -> str:
+) -> str | None:
     """
     Gets and validates an environment variable against a set of allowed choices.
 
     Args:
         env_key: The environment variable key to validate
         choices: Set of valid choices for the environment variable
-        default: Optional default value if environment variable is not set
+        default: Default value if environment variable is not set; None means optional
 
     Returns:
-        The validated environment variable value
+        The validated environment variable value, or None if not set and no default
 
     Raises:
         ValueError: If the environment variable value is not in choices
-                             or if no default is provided and env var is missing
     """
     value = os.environ.get(env_key, default)
 
     if value is None:
-        raise ValueError(
-            f"Environment variable '{env_key}' is required but not set.",
-        )
+        return None
 
     if value not in choices:
         raise ValueError(
@@ -292,3 +312,58 @@ def get_choice_from_env(
         )
 
     return value
+
+
+@overload
+def get_json_from_env(key: str, default: T, expected_type: type[T]) -> T: ...
+
+
+@overload
+def get_json_from_env(
+    key: str,
+    default: Any,
+    expected_type: None = None,
+) -> Any: ...
+
+
+def get_json_from_env(
+    key: str,
+    default: Any,
+    expected_type: type | None = None,
+) -> Any:
+    """
+    Gets an environment variable and parses it as JSON.
+
+    Args:
+        key: The environment variable key
+        default: Python value returned when the variable is not set
+        expected_type: If given, the parsed value must be an instance of it
+
+    Returns:
+        The parsed JSON value, or the default if the variable is not set
+
+    Raises:
+        ValueError: If the value is not valid JSON or is not the expected type.
+                    The message names the offending variable.
+    """
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+
+    import json
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Environment variable '{key}' is not valid JSON: {e.msg} "
+            f"(line {e.lineno}, column {e.colno}). Value: {raw!r}",
+        ) from e
+
+    if expected_type is not None and not isinstance(parsed, expected_type):
+        raise ValueError(
+            f"Environment variable '{key}' must be a JSON {expected_type.__name__}, "
+            f"got {type(parsed).__name__}",
+        )
+
+    return parsed

@@ -11,7 +11,7 @@ import { Router } from '@angular/router'
 import { RouterTestingModule } from '@angular/router/testing'
 import { NgbModal, NgbModalRef, NgbModule } from '@ng-bootstrap/ng-bootstrap'
 import { allIcons, NgxBootstrapIconsModule } from 'ngx-bootstrap-icons'
-import { throwError } from 'rxjs'
+import { of, throwError } from 'rxjs'
 import { routes } from 'src/app/app-routing.module'
 import {
   PaperlessTask,
@@ -19,7 +19,6 @@ import {
   PaperlessTaskTriggerSource,
   PaperlessTaskType,
 } from 'src/app/data/paperless-task'
-import { Results } from 'src/app/data/results'
 import { IfPermissionsDirective } from 'src/app/directives/if-permissions.directive'
 import { PermissionsGuard } from 'src/app/guards/permissions.guard'
 import { CustomDatePipe } from 'src/app/pipes/custom-date.pipe'
@@ -29,7 +28,11 @@ import { ToastService } from 'src/app/services/toast.service'
 import { environment } from 'src/environments/environment'
 import { ConfirmDialogComponent } from '../../common/confirm-dialog/confirm-dialog.component'
 import { PageHeaderComponent } from '../../common/page-header/page-header.component'
-import { TasksComponent, TaskSection } from './tasks.component'
+import {
+  TaskFilterTargetID,
+  TasksComponent,
+  TaskSection,
+} from './tasks.component'
 
 const tasks: PaperlessTask[] = [
   {
@@ -149,9 +152,11 @@ const tasks: PaperlessTask[] = [
   },
 ]
 
-const paginatedTasks: Results<PaperlessTask> = {
-  count: tasks.length,
-  results: tasks,
+const sectionCountResponse = {
+  all: 7,
+  needs_attention: 2,
+  in_progress: 3,
+  completed: 2,
 }
 
 describe('TasksComponent', () => {
@@ -193,7 +198,7 @@ describe('TasksComponent', () => {
     }).compileComponents()
 
     tasksService = TestBed.inject(TasksService)
-    reloadSpy = jest.spyOn(tasksService, 'reload')
+    reloadSpy = jest.spyOn(tasksService, 'reload').mockImplementation(() => {})
     httpTestingController = TestBed.inject(HttpTestingController)
     modalService = TestBed.inject(NgbModal)
     router = TestBed.inject(Router)
@@ -206,22 +211,34 @@ describe('TasksComponent', () => {
     httpTestingController
       .expectOne(
         (req) =>
-          req.url === `${environment.apiBaseUrl}tasks/` &&
+          req.url === `${environment.apiBaseUrl}tasks/status_counts/` &&
           req.params.get('acknowledged') === 'false' &&
-          req.params.get('page_size') === '1000'
+          !req.params.has('status')
       )
-      .flush(paginatedTasks)
+      .flush(sectionCountResponse)
 
+    flushTaskLists(10)
+  })
+
+  // answers task list requests with the fixture tasks matching their status filter
+  function flushTaskLists(pageSize: number, count?: number) {
     httpTestingController
-      .expectOne(
+      .match(
         (req) =>
           req.url === `${environment.apiBaseUrl}tasks/` &&
-          req.params.get('acknowledged') === 'false' &&
-          req.params.get('page_size') === '25' &&
-          req.params.get('page') === '1'
+          req.params.get('page_size') === `${pageSize}`
       )
-      .flush(paginatedTasks)
-  })
+      .forEach((req) => {
+        const statuses = req.request.params.getAll('status')
+        const results = tasks.filter((task) => statuses.includes(task.status))
+        req.flush({ count: count ?? results.length, results })
+      })
+  }
+
+  function selectSection(section: TaskSection, count: number) {
+    component.setSection(section)
+    flushTaskLists(25, count)
+  }
 
   it('should display task sections with counts', () => {
     expect(component.selectedSection).toBe(TaskSection.All)
@@ -295,6 +312,7 @@ describe('TasksComponent', () => {
     const headerText = header.nativeElement.textContent
 
     expect(headerText).toContain('Dismiss visible')
+    expect(headerText).toContain('Dismiss all')
     expect(headerText).toContain('Auto refresh')
     expect(headerText).not.toContain('All types')
     expect(headerText).not.toContain('All sources')
@@ -317,6 +335,7 @@ describe('TasksComponent', () => {
   })
 
   it('should render pagination controls next to the task filter', () => {
+    selectSection(TaskSection.Completed, 30)
     fixture.detectChanges()
 
     const controls = fixture.debugElement.query(By.css('.task-controls'))
@@ -327,7 +346,121 @@ describe('TasksComponent', () => {
     expect(pagination).not.toBeNull()
   })
 
+  it('should only paginate a section with more than one page of tasks', () => {
+    const pagination = () =>
+      fixture.debugElement.query(By.css('ngb-pagination'))
+
+    fixture.detectChanges()
+    expect(pagination()).toBeNull()
+
+    selectSection(TaskSection.Completed, 2)
+    fixture.detectChanges()
+    expect(pagination()).toBeNull()
+  })
+
+  it('should load the all tasks overview one section at a time', () => {
+    expect(component.tasksForSection(TaskSection.NeedsAttention)).toHaveLength(
+      2
+    )
+    expect(component.tasksForSection(TaskSection.InProgress)).toHaveLength(3)
+    expect(component.tasksForSection(TaskSection.Completed)).toHaveLength(2)
+    expect(component.totalTasks()).toBe(7)
+  })
+
+  it('should show section totals and link truncated sections to their full list', () => {
+    component.sectionCounts.update((counts) => ({
+      ...counts,
+      [TaskSection.Completed]: 27,
+    }))
+    fixture.detectChanges()
+
+    const header = (label: string) =>
+      fixture.debugElement
+        .queryAll(By.css('.section-header'))
+        .find((h) => h.nativeElement.textContent.includes(label))
+
+    expect(header('Needs attention').nativeElement.textContent).toContain(
+      '2 tasks'
+    )
+    expect(header('Needs attention').query(By.css('button'))).toBeNull()
+
+    expect(header('Recently completed').nativeElement.textContent).toContain(
+      '2 of 27 tasks'
+    )
+    header('Recently completed').query(By.css('button')).nativeElement.click()
+    expect(component.selectedSection).toBe(TaskSection.Completed)
+  })
+
+  it('should apply the selected section to the server-side task query', () => {
+    component.setSection(TaskSection.NeedsAttention)
+
+    const req = httpTestingController.expectOne(
+      (request) =>
+        request.url === `${environment.apiBaseUrl}tasks/` &&
+        request.params.get('page') === '1' &&
+        request.params.get('page_size') === '25' &&
+        request.params.get('acknowledged') === 'false' &&
+        request.params.getAll('status').includes(PaperlessTaskStatus.Failure) &&
+        request.params.getAll('status').includes(PaperlessTaskStatus.Revoked)
+    )
+
+    req.flush({ count: 2, results: [tasks[0], tasks[1]] })
+    expect(component.totalTasks()).toBe(2)
+  })
+
+  it('should apply task type and trigger source filters to the server-side task query', () => {
+    component.setTaskType(PaperlessTaskType.SanityCheck)
+
+    expect(
+      httpTestingController.match(
+        (request) =>
+          request.url === `${environment.apiBaseUrl}tasks/` &&
+          request.params.get('page_size') === '10' &&
+          request.params.get('task_type') === PaperlessTaskType.SanityCheck
+      )
+    ).toHaveLength(3)
+
+    component.setTriggerSource(PaperlessTaskTriggerSource.System)
+
+    expect(
+      httpTestingController.match(
+        (request) =>
+          request.url === `${environment.apiBaseUrl}tasks/` &&
+          request.params.get('page_size') === '10' &&
+          request.params.get('task_type') === PaperlessTaskType.SanityCheck &&
+          request.params.get('trigger_source') ===
+            PaperlessTaskTriggerSource.System
+      )
+    ).toHaveLength(3)
+  })
+
+  it('should apply text filters to the server-side task query', () => {
+    component.filterText = 'invoice'
+    jest.advanceTimersByTime(150)
+
+    expect(
+      httpTestingController.match(
+        (request) =>
+          request.url === `${environment.apiBaseUrl}tasks/` &&
+          request.params.get('page_size') === '10' &&
+          request.params.get('name') === 'invoice'
+      )
+    ).toHaveLength(3)
+
+    component.setFilterTarget(TaskFilterTargetID.Result)
+
+    expect(
+      httpTestingController.match(
+        (request) =>
+          request.url === `${environment.apiBaseUrl}tasks/` &&
+          request.params.get('page_size') === '10' &&
+          request.params.get('result') === 'invoice'
+      )
+    ).toHaveLength(3)
+  })
+
   it('should load a different task page when pagination changes', () => {
+    selectSection(TaskSection.Completed, 30)
     component.setPage(2)
 
     const pageTwoTasks = {
@@ -346,8 +479,40 @@ describe('TasksComponent', () => {
       .flush(pageTwoTasks)
 
     expect(component.page).toBe(2)
-    expect(component.totalTasks).toBe(30)
-    expect(component.pagedTasks).toEqual([tasks[0]])
+    expect(component.totalTasks()).toBe(30)
+    expect(component.pagedTasks()).toEqual([tasks[0]])
+  })
+
+  it('should not replace section counts with current-page counts', () => {
+    selectSection(TaskSection.Completed, 30)
+    component.setPage(2)
+
+    httpTestingController
+      .expectOne(
+        (req) =>
+          req.url === `${environment.apiBaseUrl}tasks/` &&
+          req.params.get('acknowledged') === 'false' &&
+          req.params.get('page_size') === '25' &&
+          req.params.get('page') === '2'
+      )
+      .flush({
+        count: 30,
+        results: [tasks[0]],
+      })
+
+    expect(component.sectionCount(TaskSection.All)).toBe(7)
+    expect(component.sectionCount(TaskSection.NeedsAttention)).toBe(2)
+    expect(component.sectionCount(TaskSection.InProgress)).toBe(3)
+    expect(component.sectionCount(TaskSection.Completed)).toBe(2)
+  })
+
+  it('should stop loading when the overview fails to load', () => {
+    component.setSection(TaskSection.All)
+    httpTestingController
+      .match((req) => req.params.get('page_size') === '10')[0]
+      .flush('', { status: 500, statusText: 'Error' })
+
+    expect(component.loading()).toBe(false)
   })
 
   it('should expose stable task type options and disable empty ones', () => {
@@ -466,7 +631,7 @@ describe('TasksComponent', () => {
 
     expect(dismissSpy).toHaveBeenCalledWith(new Set([tasks[0].id, tasks[1].id]))
     expect(toastSpy).toHaveBeenCalledWith('Error dismissing tasks', error)
-    expect(modal.componentInstance.buttonsEnabled).toBe(true)
+    expect(modal.componentInstance.buttonsEnabled()).toBe(true)
     expect(component.selectedTasks.size).toBe(0)
   })
 
@@ -493,6 +658,46 @@ describe('TasksComponent', () => {
     expect(modal).not.toBeUndefined()
     modal.componentInstance.confirmClicked.emit()
     expect(dismissSpy).toHaveBeenCalledWith(new Set([467, 466]))
+  })
+
+  it('should support dismiss all tasks', () => {
+    let modal: NgbModalRef
+    modalService.activeInstances.subscribe((m) => (modal = m[m.length - 1]))
+    const dismissSpy = jest
+      .spyOn(tasksService, 'dismissAllTasks')
+      .mockReturnValue(of({}))
+    const reloadPageSpy = jest
+      .spyOn(component as any, 'reloadPage')
+      .mockImplementation(() => undefined)
+
+    component.dismissAllTasks()
+
+    expect(modal).not.toBeUndefined()
+    expect(modal.componentInstance.messageBold).toBe('Dismiss all 7 tasks?')
+    modal.componentInstance.confirmClicked.emit()
+    expect(dismissSpy).toHaveBeenCalled()
+    expect(reloadPageSpy).toHaveBeenCalledWith(false)
+    expect(component.selectedTasks.size).toBe(0)
+  })
+
+  it('should show an error and re-enable modal buttons when dismissing all tasks fails', () => {
+    const error = new Error('dismiss all failed')
+    const toastSpy = jest.spyOn(toastService, 'showError')
+    const dismissSpy = jest
+      .spyOn(tasksService, 'dismissAllTasks')
+      .mockReturnValue(throwError(() => error))
+
+    let modal: NgbModalRef
+    modalService.activeInstances.subscribe((m) => (modal = m[m.length - 1]))
+
+    component.dismissAllTasks()
+    expect(modal).not.toBeUndefined()
+
+    modal.componentInstance.confirmClicked.emit()
+
+    expect(dismissSpy).toHaveBeenCalled()
+    expect(toastSpy).toHaveBeenCalledWith('Error dismissing tasks', error)
+    expect(modal.componentInstance.buttonsEnabled()).toBe(true)
   })
 
   it('should dismiss the currently visible scoped and filtered tasks', () => {
@@ -673,6 +878,9 @@ describe('TasksComponent', () => {
   })
 
   it('should keep clearing selection independent from resetting filters', () => {
+    component.resetFilter()
+    expect(component.filterText).toBe('')
+
     component.setTaskType(PaperlessTaskType.ConsumeFile)
     component.toggleSelected(tasks[0])
     expect(component.selectedTasks.size).toBe(1)

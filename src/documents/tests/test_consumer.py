@@ -30,11 +30,15 @@ from documents.models import Tag
 from documents.parsers import ParseError
 from documents.plugins.helpers import ProgressStatusOptions
 from documents.tasks import sanity_check
-from documents.tests.utils import DirectoriesMixin
-from documents.tests.utils import DummyProgressManager
-from documents.tests.utils import FileSystemAssertsMixin
 from documents.tests.utils import GetConsumerMixin
 from paperless_mail.models import MailRule
+from paperless_testing.assertions import FileSystemAssertsMixin
+from paperless_testing.dirs import DirectoriesMixin
+from paperless_testing.factories import DocumentFactory
+from paperless_testing.factories import TagFactory
+from paperless_testing.factories import UserFactory
+from paperless_testing.fakes.progress import FakeProgressManager
+from paperless_testing.permissions import grant_object
 
 
 class _BaseNewStyleParser:
@@ -513,6 +517,65 @@ class TestConsumer(
         self.assertTrue(group_checker.has_perm("view_document", document))
         self._assert_first_last_send_progress()
 
+    def testInboxTagsScopedToOwner(self) -> None:
+        """
+        GIVEN:
+            - Inbox tags that are owned by the document owner, unowned, owned by
+              another user but shared with the document owner, and owned by
+              another user and not shared
+            - A non-inbox tag owned by the document owner
+        WHEN:
+            - A document is consumed with that owner
+        THEN:
+            - The document gets the owned, unowned and shared inbox tags only
+        """
+        owner = UserFactory()
+        other = UserFactory()
+        owned = TagFactory(is_inbox_tag=True, owner=owner)
+        unowned = TagFactory(is_inbox_tag=True, owner=None)
+        shared = TagFactory(is_inbox_tag=True, owner=other)
+        grant_object(owner, shared, "view_tag")
+        TagFactory(is_inbox_tag=True, owner=other)
+        TagFactory(is_inbox_tag=False, owner=owner)
+
+        with self.get_consumer(
+            self.get_test_file(),
+            DocumentMetadataOverrides(owner_id=owner.pk),
+        ) as consumer:
+            consumer.run()
+
+            document = Document.objects.first()
+            assert document is not None
+
+        self.assertCountEqual(document.tags.all(), [owned, unowned, shared])
+        self._assert_first_last_send_progress()
+
+    def testInboxTagsUnownedDocument(self) -> None:
+        """
+        GIVEN:
+            - Inbox tags owned by two different users, an unowned inbox tag and
+              a non-inbox tag
+        WHEN:
+            - A document is consumed with no owner
+        THEN:
+            - The document gets every inbox tag
+        """
+        inbox_tags = [
+            TagFactory(is_inbox_tag=True, owner=UserFactory()),
+            TagFactory(is_inbox_tag=True, owner=UserFactory()),
+            TagFactory(is_inbox_tag=True, owner=None),
+        ]
+        TagFactory(is_inbox_tag=False)
+
+        with self.get_consumer(self.get_test_file()) as consumer:
+            consumer.run()
+
+            document = Document.objects.first()
+            assert document is not None
+
+        self.assertCountEqual(document.tags.all(), inbox_tags)
+        self._assert_first_last_send_progress()
+
     def testNotAFile(self) -> None:
         with self.assertRaisesMessage(ConsumerError, "File not found"):
             with self.get_consumer(Path("non-existing-file")) as consumer:
@@ -767,14 +830,16 @@ class TestConsumer(
         root_doc.archive_serial_number = 42
         root_doc.save()
 
-        actor = User.objects.create_user(
+        original_modified = timezone.now() - datetime.timedelta(days=1)
+        Document.objects.filter(pk=root_doc.pk).update(modified=original_modified)
+        actor = UserFactory(
             username="actor",
             email="actor@example.com",
             password="password",
         )
 
         version_file = self.get_test_file2()
-        status = DummyProgressManager(version_file.name, None)
+        status = FakeProgressManager(version_file.name, None)
         overrides = DocumentMetadataOverrides(
             version_label="v2",
             actor_id=actor.pk,
@@ -818,6 +883,8 @@ class TestConsumer(
         self.assertIsNone(version.archive_serial_number)
         self.assertEqual(version.original_filename, version_file.name)
         self.assertTrue(bool(version.content))
+        root_doc.refresh_from_db()
+        self.assertGreater(root_doc.modified, original_modified)
 
     @override_settings(AUDIT_LOG_ENABLED=True)
     @mock.patch("documents.consumer.load_classifier")
@@ -835,7 +902,7 @@ class TestConsumer(
         assert root_doc is not None
 
         version_file = self.get_test_file2()
-        status = DummyProgressManager(version_file.name, None)
+        status = FakeProgressManager(version_file.name, None)
         overrides = DocumentMetadataOverrides(
             filename="valid_pdf_version-upload",
             actor_id=999999,
@@ -892,7 +959,7 @@ class TestConsumer(
         assert root_doc is not None
 
         def consume_version(version_file: Path) -> Document:
-            status = DummyProgressManager(version_file.name, None)
+            status = FakeProgressManager(version_file.name, None)
             overrides = DocumentMetadataOverrides()
             doc = ConsumableDocument(
                 DocumentSource.ApiUpload,
@@ -1120,12 +1187,14 @@ class TestConsumer(
             self.assertEqual(command[1], "--replace-input")
 
     @mock.patch("paperless_mail.models.MailRule.objects.get")
+    @mock.patch("paperless.parsers.mail.MailDocumentParser.get_thumbnail")
     @mock.patch("paperless.parsers.mail.MailDocumentParser.parse")
     @mock.patch("documents.consumer.get_parser_registry")
     def test_mail_parser_receives_mailrule(
         self,
         mock_get_parser_registry: mock.Mock,
         mock_mail_parser_parse: mock.Mock,
+        mock_get_thumbnail: mock.Mock,
         mock_mailrule_get: mock.Mock,
     ) -> None:
         """
@@ -1136,6 +1205,7 @@ class TestConsumer(
         THEN:
             - The mail parser should receive the mail rule
         """
+        from documents.parsers import ParseError
         from paperless.parsers.mail import MailDocumentParser
 
         mock_get_parser_registry.return_value.get_parser_for_file.return_value = (
@@ -1144,19 +1214,24 @@ class TestConsumer(
         mock_mailrule_get.return_value = mock.Mock(
             pdf_layout=MailRule.PdfLayout.HTML_ONLY,
         )
+        mock_get_thumbnail.side_effect = ParseError("no thumbnail")
+
+        src = (
+            Path(__file__).parent.parent.parent
+            / Path("paperless")
+            / Path("tests")
+            / Path("samples")
+            / Path("mail")
+            / "html.eml"
+        )
+        dst = self.dirs.scratch_dir / "html.eml"
+        shutil.copy(src, dst)
+
         with self.get_consumer(
-            filepath=(
-                Path(__file__).parent.parent.parent
-                / Path("paperless")
-                / Path("tests")
-                / Path("samples")
-                / Path("mail")
-            ).resolve()
-            / "html.eml",
+            filepath=dst,
             source=DocumentSource.MailFetch,
             mailrule_id=1,
         ) as consumer:
-            # fails because no gotenberg
             with self.assertRaises(
                 ConsumerError,
             ):
@@ -1166,6 +1241,29 @@ class TestConsumer(
                 "message/rfc822",
                 produce_archive=True,
             )
+
+    @mock.patch("documents.consumer.generate_unique_filename")
+    def test_consume_refuses_to_write_outside_originals_dir(
+        self,
+        m: mock.Mock,
+    ) -> None:
+        """
+        GIVEN:
+            - Filename generation produces a path outside of the originals directory
+        WHEN:
+            - The document is consumed
+        THEN:
+            - The consumption fails and no file is written outside of the root
+        """
+        m.return_value = Path("../../pwned.pdf")
+        escaped = (settings.ORIGINALS_DIR / ".." / ".." / "pwned.pdf").resolve()
+
+        with self.get_consumer(self.get_test_file()) as consumer:
+            with self.assertRaises(ConsumerError):
+                consumer.run()
+
+        self.assertIsNotFile(escaped)
+        self.assertEqual(Document.objects.count(), 0)
 
 
 @mock.patch("documents.consumer.magic.from_file", fake_magic_from_file)
@@ -1317,7 +1415,7 @@ class PreConsumeTestCase(DirectoriesMixin, GetConsumerMixin, TestCase):
         with self.get_consumer(self.test_file) as c:
             c.run()
             # Verify no pre-consume script subprocess was invoked
-            # (run_subprocess may still be called by _extract_text_for_archive_check)
+            # (run_subprocess may still be called by pdf_born_digital_text via pdftotext)
             script_calls = [
                 call
                 for call in m.call_args_list
@@ -1342,7 +1440,7 @@ class PreConsumeTestCase(DirectoriesMixin, GetConsumerMixin, TestCase):
                     self.assertTrue(m.called)
 
                     # Find the call that invoked the pre-consume script
-                    # (run_subprocess may also be called by _extract_text_for_archive_check)
+                    # (run_subprocess may also be called by pdf_born_digital_text via pdftotext)
                     script_call = next(
                         call
                         for call in m.call_args_list
@@ -1547,12 +1645,92 @@ class PostConsumeTestCase(DirectoriesMixin, GetConsumerMixin, TestCase):
                         consumer.run_post_consume_script(doc)
 
 
+class TestConsumerRemoteOCR(
+    DirectoriesMixin,
+    FileSystemAssertsMixin,
+    GetConsumerMixin,
+    TestCase,
+):
+    """
+    The consumer resolves the remote OCR mode and the per-document request from
+    workflows into the allow_remote flag it hands to the parser registry.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+
+        patcher = mock.patch("documents.consumer.get_parser_registry")
+        self.mock_registry = patcher.start()
+        self.mock_registry.return_value.get_parser_for_file.return_value = DummyParser
+        self.addCleanup(patcher.stop)
+
+    def _consume(self, *, overrides: DocumentMetadataOverrides | None = None) -> bool:
+        src = (
+            Path(__file__).parent
+            / "samples"
+            / "documents"
+            / "originals"
+            / "0000001.pdf"
+        )
+        dst = self.dirs.scratch_dir / "sample.pdf"
+        shutil.copy(src, dst)
+
+        with self.get_consumer(dst, overrides=overrides) as consumer:
+            consumer.run()
+
+        _, kwargs = self.mock_registry.return_value.get_parser_for_file.call_args
+        return kwargs["allow_remote"]
+
+    @override_settings(REMOTE_OCR_MODE="always")
+    def test_always_mode_allows_remote(self) -> None:
+        """
+        GIVEN: Remote OCR mode is 'always'.
+        WHEN:  A document is consumed without any workflow asking for it.
+        THEN:  The registry is allowed to pick the remote parser.
+        """
+        self.assertTrue(self._consume())
+
+    @override_settings(REMOTE_OCR_MODE="workflow_only")
+    def test_workflow_only_mode_denies_remote_by_default(self) -> None:
+        """
+        GIVEN: Remote OCR mode is 'workflow_only'.
+        WHEN:  A document is consumed and nothing asked for remote OCR.
+        THEN:  The remote parser is excluded.
+        """
+        self.assertFalse(self._consume())
+
+    @override_settings(REMOTE_OCR_MODE="workflow_only")
+    def test_workflow_only_mode_allows_remote_when_requested(self) -> None:
+        """
+        GIVEN: Remote OCR mode is 'workflow_only'.
+        WHEN:  A workflow set remote_ocr on the metadata overrides.
+        THEN:  The registry is allowed to pick the remote parser.
+        """
+        self.assertTrue(
+            self._consume(overrides=DocumentMetadataOverrides(remote_ocr=True)),
+        )
+
+
 class TestMetadataOverrides(TestCase):
     def test_update_skip_asn_if_exists(self) -> None:
         base = DocumentMetadataOverrides()
         incoming = DocumentMetadataOverrides(skip_asn_if_exists=True)
         base.update(incoming)
         self.assertTrue(base.skip_asn_if_exists)
+
+    def test_update_remote_ocr(self) -> None:
+        base = DocumentMetadataOverrides()
+        base.update(DocumentMetadataOverrides(remote_ocr=True))
+        self.assertTrue(base.remote_ocr)
+
+    def test_update_remote_ocr_is_not_unset(self) -> None:
+        """
+        A later workflow that says nothing must not undo an earlier one that
+        asked for remote OCR.
+        """
+        base = DocumentMetadataOverrides(remote_ocr=True)
+        base.update(DocumentMetadataOverrides())
+        self.assertTrue(base.remote_ocr)
 
     def test_update_actor_and_version_label(self) -> None:
         base = DocumentMetadataOverrides(
@@ -1566,6 +1744,32 @@ class TestMetadataOverrides(TestCase):
         base.update(incoming)
         self.assertEqual(base.actor_id, 2)
         self.assertEqual(base.version_label, "v2")
+
+    def test_from_document_copies_user_and_group_grants_separately(self) -> None:
+        """
+        GIVEN:
+            - A document with view and change granted directly to one user and
+              to a group with another user as a member
+        WHEN:
+            - Overrides are built from the document
+        THEN:
+            - The user lists hold only the directly granted user
+            - The group lists hold the group
+        """
+        direct_user = UserFactory()
+        group_member = UserFactory()
+        group = Group.objects.create(name="group")
+        group_member.groups.add(group)
+        document = DocumentFactory()
+        grant_object(direct_user, document, "view_document", "change_document")
+        grant_object(group, document, "view_document", "change_document")
+
+        overrides = DocumentMetadataOverrides.from_document(document)
+
+        self.assertEqual(overrides.view_users, [direct_user.pk])
+        self.assertEqual(overrides.change_users, [direct_user.pk])
+        self.assertEqual(overrides.view_groups, [group.pk])
+        self.assertEqual(overrides.change_groups, [group.pk])
 
 
 class TestBarcodeApplyDetectedASN(TestCase):

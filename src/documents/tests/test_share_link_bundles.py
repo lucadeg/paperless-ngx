@@ -7,6 +7,7 @@ from unittest import mock
 
 from django.conf import settings
 from django.contrib.auth.models import User
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework import serializers
 from rest_framework import status
@@ -18,8 +19,11 @@ from documents.models import ShareLinkBundle
 from documents.serialisers import ShareLinkBundleSerializer
 from documents.tasks import build_share_link_bundle
 from documents.tasks import cleanup_expired_share_link_bundles
-from documents.tests.factories import DocumentFactory
-from documents.tests.utils import DirectoriesMixin
+from paperless_testing.dirs import DirectoriesMixin
+from paperless_testing.factories import DocumentFactory
+from paperless_testing.factories import UserFactory
+from paperless_testing.permissions import grant_global
+from paperless_testing.permissions import grant_object
 
 
 class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
@@ -27,7 +31,7 @@ class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.user = User.objects.create_superuser(username="bundle_admin")
+        self.user = UserFactory(username="bundle_admin", superuser=True)
         self.client.force_authenticate(self.user)
         self.document = DocumentFactory.create()
 
@@ -48,6 +52,33 @@ class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
         delay_mock.assert_called_once()
         self.assertEqual(delay_mock.call_args.kwargs["kwargs"]["bundle_id"], bundle.pk)
 
+    @mock.patch("documents.views.build_share_link_bundle.apply_async")
+    def test_create_bundle_requires_global_document_view_permission(
+        self,
+        delay_mock,
+    ) -> None:
+        owner = UserFactory(username="document_owner")
+        requester = UserFactory(username="bundle_creator")
+        grant_global(requester, "add_sharelinkbundle")
+        document = DocumentFactory.create(owner=owner)
+        grant_object(requester, document, "view_document")
+        self.client.force_authenticate(requester)
+        payload = {
+            "document_ids": [document.pk],
+            "file_version": ShareLink.FileVersion.ARCHIVE,
+            "expiration_days": 7,
+        }
+
+        response = self.client.post(self.ENDPOINT, payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        grant_global(requester, "view_document")
+        requester = User.objects.get(pk=requester.pk)
+        self.client.force_authenticate(requester)
+        response = self.client.post(self.ENDPOINT, payload, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        delay_mock.assert_called_once()
+
     def test_create_bundle_rejects_missing_documents(self) -> None:
         payload = {
             "document_ids": [9999],
@@ -60,10 +91,13 @@ class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("document_ids", response.data)
 
-    @mock.patch("documents.views.has_perms_owner_aware", return_value=False)
-    def test_create_bundle_rejects_insufficient_permissions(self, perms_mock) -> None:
+    def test_create_bundle_rejects_insufficient_permissions(self) -> None:
+        requester = UserFactory(username="bundle_creator")
+        grant_global(requester, "add_sharelinkbundle", "view_document")
+        self.client.force_authenticate(requester)
+        document = DocumentFactory(owner=UserFactory(username="document_owner"))
         payload = {
-            "document_ids": [self.document.pk],
+            "document_ids": [self.document.pk, document.pk],
             "file_version": ShareLink.FileVersion.ARCHIVE,
             "expiration_days": 7,
         }
@@ -71,8 +105,8 @@ class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
         response = self.client.post(self.ENDPOINT, payload, format="json")
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("document_ids", response.data)
-        perms_mock.assert_called()
+        self.assertIn(str(document.pk), str(response.data["document_ids"]))
+        self.assertFalse(ShareLinkBundle.objects.exists())
 
     @mock.patch("documents.views.build_share_link_bundle.apply_async")
     def test_rebuild_bundle_resets_state(self, delay_mock) -> None:
@@ -124,7 +158,7 @@ class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
         self.assertIn("document_ids", response.data)
 
     def test_download_ready_bundle_streams_file(self) -> None:
-        bundle_file = Path(self.dirs.media_dir) / "bundles" / "ready.zip"
+        bundle_file = settings.SHARE_LINK_BUNDLE_DIR / "bundles" / "ready.zip"
         bundle_file.parent.mkdir(parents=True, exist_ok=True)
         bundle_file.write_bytes(b"binary-zip-content")
 
@@ -132,7 +166,7 @@ class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
             slug="readyslug",
             file_version=ShareLink.FileVersion.ARCHIVE,
             status=ShareLinkBundle.Status.READY,
-            file_path=str(bundle_file),
+            file_path=str(bundle_file.relative_to(settings.SHARE_LINK_BUNDLE_DIR)),
         )
         bundle.documents.set([self.document])
 
@@ -192,6 +226,69 @@ class ShareLinkBundleAPITests(DirectoriesMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_302_FOUND)
         self.assertIn("sharelink_notfound=1", response["Location"])
 
+    @override_settings(LOGIN_URL="/paperless/accounts/login/")
+    def test_unknown_share_link_redirects_under_subpath(self) -> None:
+        """
+        GIVEN:
+            - Paperless is served under a subpath
+        WHEN:
+            - An unknown public share link is requested
+        THEN:
+            - The redirect to the login page keeps the subpath
+        """
+        self.client.logout()
+        response = self.client.get("/share/unknownsharelink/")
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(
+            response["Location"],
+            "/paperless/accounts/login/?sharelink_notfound=1",
+        )
+
+    def test_share_link_missing_file_redirects(self) -> None:
+        """
+        GIVEN:
+            - A share link whose document file is missing from disk
+        WHEN:
+            - The public share link is requested anonymously
+        THEN:
+            - The user is redirected to login instead of a 500 error
+        """
+        doc = DocumentFactory.create(filename="missing-original.pdf")
+        share_link = ShareLink.objects.create(
+            slug="missingfilelink",
+            document=doc,
+            file_version=ShareLink.FileVersion.ORIGINAL,
+        )
+
+        self.client.logout()
+        response = self.client.get(f"/share/{share_link.slug}/")
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertIn("sharelink_notfound=1", response["Location"])
+
+    def test_download_ready_bundle_missing_file_returns_503(self) -> None:
+        """
+        GIVEN:
+            - A READY bundle whose zip file is missing from disk
+        WHEN:
+            - The public share link is requested anonymously
+        THEN:
+            - A 503 is returned instead of a 500 error
+        """
+        bundle = ShareLinkBundle.objects.create(
+            slug="missingbundlefile",
+            file_version=ShareLink.FileVersion.ARCHIVE,
+            status=ShareLinkBundle.Status.READY,
+            file_path="bundles/gone.zip",
+        )
+        bundle.documents.set([self.document])
+
+        self.client.logout()
+        response = self.client.get(f"/share/{bundle.slug}/")
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
 
 class ShareLinkBundleTaskTests(DirectoriesMixin, APITestCase):
     def setUp(self) -> None:
@@ -199,11 +296,11 @@ class ShareLinkBundleTaskTests(DirectoriesMixin, APITestCase):
         self.document = DocumentFactory.create()
 
     def test_cleanup_expired_share_link_bundles(self) -> None:
-        expired_path = Path(self.dirs.media_dir) / "expired.zip"
+        expired_path = settings.SHARE_LINK_BUNDLE_DIR / "expired.zip"
         expired_path.parent.mkdir(parents=True, exist_ok=True)
         expired_path.write_bytes(b"expired")
 
-        active_path = Path(self.dirs.media_dir) / "active.zip"
+        active_path = settings.SHARE_LINK_BUNDLE_DIR / "active.zip"
         active_path.write_bytes(b"active")
 
         expired_bundle = ShareLinkBundle.objects.create(
@@ -211,7 +308,7 @@ class ShareLinkBundleTaskTests(DirectoriesMixin, APITestCase):
             file_version=ShareLink.FileVersion.ARCHIVE,
             status=ShareLinkBundle.Status.READY,
             expiration=timezone.now() - timedelta(days=1),
-            file_path=str(expired_path),
+            file_path=expired_path.name,
         )
         expired_bundle.documents.set([self.document])
 
@@ -220,7 +317,7 @@ class ShareLinkBundleTaskTests(DirectoriesMixin, APITestCase):
             file_version=ShareLink.FileVersion.ARCHIVE,
             status=ShareLinkBundle.Status.READY,
             expiration=timezone.now() + timedelta(days=1),
-            file_path=str(active_path),
+            file_path=active_path.name,
         )
         active_bundle.documents.set([self.document])
 
@@ -265,15 +362,6 @@ class ShareLinkBundleBuildTaskTests(DirectoriesMixin, APITestCase):
         )
         self.document.archive_checksum = ""
         self.document.save()
-        self.addCleanup(
-            setattr,
-            settings,
-            "SHARE_LINK_BUNDLE_DIR",
-            settings.SHARE_LINK_BUNDLE_DIR,
-        )
-        settings.SHARE_LINK_BUNDLE_DIR = (
-            Path(settings.MEDIA_ROOT) / "documents" / "share_link_bundles"
-        )
 
     def _write_document_file(self, *, archive: bool, content: bytes) -> Path:
         if archive:
@@ -424,7 +512,7 @@ class ShareLinkBundleFilterSetTests(DirectoriesMixin, APITestCase):
 
 
 class ShareLinkBundleModelTests(DirectoriesMixin, APITestCase):
-    def test_absolute_file_path_handles_relative_and_absolute(self) -> None:
+    def test_absolute_file_path_handles_relative_path(self) -> None:
         relative_path = Path("relative.zip")
         bundle = ShareLinkBundle.objects.create(
             slug="relative-bundle",
@@ -437,10 +525,23 @@ class ShareLinkBundleModelTests(DirectoriesMixin, APITestCase):
             (settings.SHARE_LINK_BUNDLE_DIR / relative_path).resolve(),
         )
 
-        absolute_path = Path(self.dirs.media_dir) / "absolute.zip"
-        bundle.file_path = str(absolute_path)
+    def test_absolute_file_path_rejects_absolute_path(self) -> None:
+        bundle = ShareLinkBundle.objects.create(
+            slug="absolute-bundle",
+            file_version=ShareLink.FileVersion.ORIGINAL,
+            file_path=str(Path(self.dirs.media_dir) / "absolute.zip"),
+        )
 
-        self.assertEqual(bundle.absolute_file_path.resolve(), absolute_path.resolve())
+        self.assertIsNone(bundle.absolute_file_path)
+
+    def test_absolute_file_path_rejects_traversal_outside_bundle_dir(self) -> None:
+        bundle = ShareLinkBundle.objects.create(
+            slug="traversal-bundle",
+            file_version=ShareLink.FileVersion.ORIGINAL,
+            file_path="../escaped.zip",
+        )
+
+        self.assertIsNone(bundle.absolute_file_path)
 
     def test_str_returns_translated_slug(self) -> None:
         bundle = ShareLinkBundle.objects.create(

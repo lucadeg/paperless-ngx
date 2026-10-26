@@ -5,8 +5,6 @@ from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
-from django.contrib.auth.models import Permission
-from django.contrib.auth.models import User
 from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status
@@ -14,8 +12,10 @@ from rest_framework.test import APITestCase
 
 from documents.models import PaperlessTask
 from documents.permissions import has_system_status_permission
-from documents.tests.factories import PaperlessTaskFactory
 from paperless import version
+from paperless_testing.factories import PaperlessTaskFactory
+from paperless_testing.factories import UserFactory
+from paperless_testing.permissions import grant_global
 
 
 class TestSystemStatus(APITestCase):
@@ -23,9 +23,7 @@ class TestSystemStatus(APITestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.user = User.objects.create_superuser(
-            username="temp_admin",
-        )
+        self.user = UserFactory(username="temp_admin", superuser=True)
         self.tmp_dir = Path(tempfile.mkdtemp())
         self.override = override_settings(MEDIA_ROOT=self.tmp_dir)
         self.override.enable()
@@ -96,7 +94,7 @@ class TestSystemStatus(APITestCase):
         response = self.client.get(self.ENDPOINT)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
         self.assertEqual(response["WWW-Authenticate"], "Token")
-        normal_user = User.objects.create_user(username="normal_user")
+        normal_user = UserFactory(username="normal_user")
         self.client.force_login(normal_user)
         response = self.client.get(self.ENDPOINT)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
@@ -107,10 +105,8 @@ class TestSystemStatus(APITestCase):
         response = self.client.get(self.ENDPOINT)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
-        user = User.objects.create_user(username="status_user")
-        user.user_permissions.add(
-            Permission.objects.get(codename="view_system_monitoring"),
-        )
+        user = UserFactory(username="status_user")
+        grant_global(user, "view_system_monitoring")
 
         self.client.force_login(user)
         response = self.client.get(self.ENDPOINT)
@@ -215,6 +211,77 @@ class TestSystemStatus(APITestCase):
         response = self.client.get(self.ENDPOINT)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["tasks"]["celery_status"], "OK")
+
+    @mock.patch("celery.app.control.Inspect.ping")
+    def test_system_status_celery_ping_none(self, mock_ping) -> None:
+        """
+        GIVEN:
+            - Celery ping returns no worker responses
+        WHEN:
+            - The user requests the system status
+        THEN:
+            - The response contains a warning celery status
+        """
+        mock_ping.return_value = None
+        self.client.force_login(self.user)
+        response = self.client.get(self.ENDPOINT)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["tasks"]["celery_status"], "WARNING")
+        self.assertEqual(
+            response.data["tasks"]["celery_error"],
+            "No celery workers responded to ping. This may be temporary.",
+        )
+
+    @mock.patch("celery.app.control.Inspect.ping")
+    def test_system_status_celery_ping_unexpected_responses(self, mock_ping) -> None:
+        """
+        GIVEN:
+            - Celery ping returns an unexpected worker response
+        WHEN:
+            - The user requests the system status
+        THEN:
+            - The response contains a warning celery status
+        """
+        self.client.force_login(self.user)
+        for ping_response in (
+            {"hostname": {"ok": "not-pong"}},
+            {"hostname": {}},
+            {"hostname": "pong"},
+        ):
+            with self.subTest(ping_response=ping_response):
+                mock_ping.return_value = ping_response
+                response = self.client.get(self.ENDPOINT)
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertEqual(response.data["tasks"]["celery_status"], "WARNING")
+                self.assertEqual(response.data["tasks"]["celery_url"], "hostname")
+                self.assertEqual(
+                    response.data["tasks"]["celery_error"],
+                    "Celery worker responded unexpectedly.",
+                )
+
+    @mock.patch("documents.views.sleep")
+    @mock.patch("celery.app.control.Inspect.ping")
+    def test_system_status_celery_ping_retry_success(
+        self,
+        mock_ping,
+        mock_sleep,
+    ) -> None:
+        """
+        GIVEN:
+            - Celery ping fails once but succeeds on retry
+        WHEN:
+            - The user requests the system status
+        THEN:
+            - The response contains an OK celery status
+        """
+        mock_ping.side_effect = [None, {"hostname": {"ok": "pong"}}]
+        self.client.force_login(self.user)
+        response = self.client.get(self.ENDPOINT)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["tasks"]["celery_status"], "OK")
+        self.assertIsNone(response.data["tasks"]["celery_error"])
+        self.assertEqual(mock_ping.call_count, 2)
+        mock_sleep.assert_called_once_with(0.25)
 
     @mock.patch("documents.search.get_backend")
     def test_system_status_index_ok(self, mock_get_backend) -> None:

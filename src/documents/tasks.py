@@ -20,6 +20,7 @@ from filelock import FileLock
 
 from documents import sanity_checker
 from documents.barcodes import BarcodePlugin
+from documents.barcodes import read_barcode_values
 from documents.bulk_download import ArchiveOnlyStrategy
 from documents.bulk_download import OriginalsOnlyStrategy
 from documents.caching import clear_document_caches
@@ -36,6 +37,7 @@ from documents.data_models import ConsumeFileDuplicateResult
 from documents.data_models import ConsumeFileStoppedResult
 from documents.data_models import ConsumeFileSuccessResult
 from documents.data_models import DocumentMetadataOverrides
+from documents.data_models import StoredBarcode
 from documents.double_sided import CollatePlugin
 from documents.file_handling import create_source_path_directory
 from documents.file_handling import generate_unique_filename
@@ -43,6 +45,7 @@ from documents.matching import prefilter_documents_by_workflowtrigger
 from documents.models import Correspondent
 from documents.models import CustomFieldInstance
 from documents.models import Document
+from documents.models import DocumentBarcode
 from documents.models import DocumentType
 from documents.models import PaperlessTask
 from documents.models import ShareLink
@@ -56,6 +59,7 @@ from documents.plugins.base import StopConsumeTaskError
 from documents.plugins.helpers import ProgressManager
 from documents.plugins.helpers import ProgressStatusOptions
 from documents.sanity_checker import SanityCheckFailedException
+from documents.search._backend import SearchIndexLockError
 from documents.signals import document_updated
 from documents.signals.handlers import cleanup_document_deletion
 from documents.signals.handlers import run_workflows
@@ -63,11 +67,15 @@ from documents.signals.handlers import send_websocket_document_updated
 from documents.utils import IterWrapper
 from documents.utils import compute_checksum
 from documents.utils import identity
+from documents.versioning import annotate_effective_content
 from documents.workflows.utils import get_workflows_for_trigger
 from paperless.config import AIConfig
+from paperless.config import BarcodeConfig
+from paperless.config import RemoteOCRConfig
 from paperless.logging import consume_task_id
 from paperless.parsers import ParserContext
 from paperless.parsers.registry import get_parser_registry
+from paperless_ai.exceptions import LLMTimeoutError
 from paperless_ai.indexing import llm_index_add_or_update_document
 from paperless_ai.indexing import llm_index_remove_document
 from paperless_ai.indexing import update_llm_index
@@ -82,6 +90,60 @@ def index_optimize() -> None:
     logger.info(
         "index_optimize is a no-op — Tantivy manages segment merging automatically.",
     )
+
+
+@shared_task(
+    bind=True,
+    ignore_result=True,
+    autoretry_for=(SearchIndexLockError,),
+    max_retries=5,
+    retry_backoff=60,
+    retry_jitter=True,
+)
+def index_document(self, document_id: int) -> None:
+    """
+    Deferred single-document index write.
+
+    Used as a self-healing fallback when add_or_update() exhausts its lock retry
+    budget during high-concurrency consumption. Runs via batch_update() directly
+    to avoid re-entering the deferred scheduling path in add_or_update().
+
+    If the document was deleted before this task runs, it exits cleanly.
+    """
+    from documents.search import get_backend
+
+    try:
+        document = Document.objects.get(pk=document_id)
+    except Document.DoesNotExist:
+        logger.info(
+            "index_document: document %d no longer exists; skipping",
+            document_id,
+        )
+        return
+    with get_backend().batch_update() as batch:
+        batch.add_or_update(document)
+
+
+@shared_task(
+    bind=True,
+    ignore_result=True,
+    autoretry_for=(SearchIndexLockError,),
+    max_retries=5,
+    retry_backoff=60,
+    retry_jitter=True,
+)
+def remove_document_from_index(self, doc_id: int) -> None:
+    """
+    Deferred single-document index removal.
+
+    Used as a self-healing fallback when remove() exhausts its lock retry budget.
+    Operates only on the Tantivy index; no database lookup required.
+    If the document has already been removed, the term-query delete is a no-op.
+    """
+    from documents.search import get_backend
+
+    with get_backend().batch_update() as batch:
+        batch.remove(doc_id)
 
 
 @shared_task
@@ -253,7 +315,14 @@ def sanity_check(*, raise_on_error: bool = True) -> str:
 def bulk_update_documents(document_ids) -> None:
     from documents.search import get_backend
 
-    documents = Document.objects.filter(id__in=document_ids)
+    document_ids = list(document_ids)
+    # Annotated so the signal handlers below (e.g. matching) don't query the
+    # versions of each document. Indexing re-queries and re-annotates its own
+    # copy via add_or_update_ids() below, after these signals (and any
+    # workflow they trigger) have had a chance to mutate the documents.
+    documents = annotate_effective_content(
+        Document.objects.filter(id__in=document_ids),
+    )
 
     for doc in documents:
         clear_document_caches(doc.pk)
@@ -261,25 +330,56 @@ def bulk_update_documents(document_ids) -> None:
             sender=None,
             document=doc,
             logging_group=uuid.uuid4(),
+            skip_ai_index=True,  # bulk path calls update_llm_index once below
         )
         post_save.send(Document, instance=doc, created=False)
 
     with get_backend().batch_update() as batch:
-        for doc in documents:
-            batch.add_or_update(doc)
+        batch.add_or_update_ids(document_ids)
 
     ai_config = AIConfig()
     if ai_config.llm_index_enabled:
         update_llm_index(
             rebuild=False,
+            document_ids=document_ids,
         )
 
 
+def _read_barcodes_for_reprocess(document: Document) -> list[StoredBarcode] | None:
+    """
+    Reads the barcodes of the original again, e.g. for documents consumed
+    before storing them was enabled. Returns None if they should be left as
+    they are: storing is off, the file can't be scanned with the current
+    settings, or the scan failed.
+    """
+    barcode_settings = BarcodeConfig()
+    if not barcode_settings.barcode_store_values:
+        return None
+    try:
+        with TemporaryDirectory(dir=settings.SCRATCH_DIR) as tmpdir:
+            return read_barcode_values(
+                document.source_path,
+                document.mime_type,
+                barcode_settings,
+                Path(tmpdir),
+            )
+    except Exception as e:
+        logger.warning(f"Could not read barcodes of document {document}: {e}")
+        return None
+
+
 @shared_task
-def update_document_content_maybe_archive_file(document_id) -> None:
+def update_document_content_maybe_archive_file(
+    document_id,
+    *,
+    remote_ocr: bool = False,
+) -> None:
     """
     Re-creates OCR content and thumbnail for a document, and archive file if
     it exists.
+
+    Remote OCR is used only when the engine is configured to handle everything
+    or if explicitly asked for via ``remote_ocr``.
     """
     document = Document.objects.get(id=document_id)
 
@@ -289,6 +389,7 @@ def update_document_content_maybe_archive_file(document_id) -> None:
         mime_type,
         document.original_filename or "",
         document.source_path,
+        allow_remote=remote_ocr or RemoteOCRConfig().remote_ocr_by_default,
     )
 
     if not parser_class:
@@ -312,6 +413,8 @@ def update_document_content_maybe_archive_file(document_id) -> None:
                 mime_type,
                 produce_archive=produce_archive,
             )
+
+            barcodes = _read_barcodes_for_reprocess(document)
 
             thumbnail = parser.get_thumbnail(document.source_path, mime_type)
 
@@ -369,6 +472,17 @@ def update_document_content_maybe_archive_file(document_id) -> None:
                             action=LogEntry.Action.UPDATE,
                         )
 
+                if barcodes is not None:
+                    document.barcodes.all().delete()
+                    DocumentBarcode.objects.bulk_create(
+                        DocumentBarcode(document=document, **barcode)
+                        for barcode in barcodes
+                    )
+                    # metadata_etag includes modified
+                    Document.objects.filter(pk=document.pk).update(
+                        modified=timezone.now(),
+                    )
+
                 with FileLock(settings.MEDIA_LOCK):
                     if parser.get_archive_path():
                         create_source_path_directory(document.archive_path)
@@ -388,6 +502,8 @@ def update_document_content_maybe_archive_file(document_id) -> None:
                 llm_index_add_or_update_document(document)
 
             clear_document_caches(document.pk)
+            if document.root_document_id is not None:
+                clear_document_caches(document.root_document_id)
 
         except Exception:
             logger.exception(
@@ -641,6 +757,45 @@ def llmindex_index(
         iter_wrapper=iter_wrapper,
         rebuild=rebuild,
     )
+
+
+@shared_task(
+    bind=True,
+    autoretry_for=(LLMTimeoutError,),
+    max_retries=3,
+    retry_backoff=60,
+    retry_backoff_max=600,
+    retry_jitter=True,
+)
+def apply_ai_suggestions(self, action_id: int, document_id: int) -> None:
+    """
+    Deferred "apply AI suggestions" workflow action.
+    """
+    from documents.models import WorkflowAction
+    from documents.workflows.ai import apply_ai_suggestions_to_document
+
+    try:
+        action = WorkflowAction.objects.get(pk=action_id)
+        document = Document.objects.select_related("owner").get(pk=document_id)
+    except (WorkflowAction.DoesNotExist, Document.DoesNotExist):
+        logger.warning(
+            "Workflow action %s or document %s no longer exists, "
+            "not applying AI suggestions",
+            action_id,
+            document_id,
+        )
+        return
+
+    if not apply_ai_suggestions_to_document(action, document):
+        return
+
+    # No document_updated signal to avoid loop
+    clear_document_caches(document.pk)
+    index_document.delay(document.pk)
+
+    ai_config = AIConfig()
+    if ai_config.llm_index_enabled:
+        update_document_in_llm_index.apply_async(kwargs={"document": document})
 
 
 @shared_task

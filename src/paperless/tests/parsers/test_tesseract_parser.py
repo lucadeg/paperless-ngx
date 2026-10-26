@@ -15,13 +15,14 @@ from typing import TYPE_CHECKING
 
 import pytest
 from ocrmypdf import SubprocessOutputError
+from PIL import Image
 
 from documents.parsers import ParseError
-from documents.parsers import run_convert
+from documents.parsers import rasterize_pdf_page_to_png
 from paperless.models import ModeChoices
 from paperless.parsers import ParserProtocol
 from paperless.parsers.tesseract import RasterisedDocumentParser
-from paperless.parsers.tesseract import post_process_text
+from paperless.parsers.utils import is_tagged_pdf
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -149,36 +150,6 @@ class TestRasterisedDocumentParserLifecycle:
                 tempdir = parser.tempdir
                 raise RuntimeError("boom")
         assert tempdir is not None and not tempdir.exists()
-
-
-# ---------------------------------------------------------------------------
-# post_process_text
-# ---------------------------------------------------------------------------
-
-
-class TestPostProcessText:
-    @pytest.mark.parametrize(
-        ("source", "expected"),
-        [
-            pytest.param(
-                "simple     string",
-                "simple string",
-                id="collapse-spaces",
-            ),
-            pytest.param(
-                "simple    newline\n   testing string",
-                "simple newline\ntesting string",
-                id="preserve-newline",
-            ),
-            pytest.param(
-                "utf-8   строка с пробелами в конце  ",  # noqa: RUF001
-                "utf-8 строка с пробелами в конце",  # noqa: RUF001
-                id="utf8-trailing-spaces",
-            ),
-        ],
-    )
-    def test_post_process_text(self, source: str, expected: str) -> None:
-        assert post_process_text(source) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -310,24 +281,71 @@ class TestGetThumbnail:
         )
         assert thumb.is_file()
 
-    def test_thumbnail_fallback_on_convert_error(
+    @pytest.mark.parametrize(
+        ("filename", "expected_height"),
+        [
+            pytest.param("simple-digital.pdf", 647, id="portrait-letter"),
+            pytest.param("rotated.pdf", 386, id="landscape"),
+        ],
+    )
+    def test_thumbnail_is_correct_format_and_size(
+        self,
+        tesseract_parser: RasterisedDocumentParser,
+        tesseract_samples_dir: Path,
+        filename: str,
+        expected_height: int,
+    ) -> None:
+        """
+        GIVEN:
+            - A portrait or landscape PDF
+        WHEN:
+            - A thumbnail is generated
+        THEN:
+            - A 500px wide WebP keeping the page's aspect ratio
+        """
+        thumb = tesseract_parser.get_thumbnail(
+            tesseract_samples_dir / filename,
+            "application/pdf",
+        )
+        with Image.open(thumb) as im:
+            assert im.format == "WEBP"
+            assert im.width == 500
+            assert im.height == pytest.approx(expected_height, abs=2)
+
+    def test_thumbnail_fallback_on_pdftoppm_error(
         self,
         mocker: MockerFixture,
         tesseract_parser: RasterisedDocumentParser,
         tesseract_samples_dir: Path,
     ) -> None:
-        def _raise_on_pdf(input_file, output_file, **kwargs) -> None:
-            if ".pdf" in str(input_file):
+        """
+        GIVEN:
+            - Rasterizing the original PDF fails
+        WHEN:
+            - A thumbnail is generated
+        THEN:
+            - The PDF is repaired with qpdf and a real thumbnail is rendered
+        """
+        original = tesseract_samples_dir / "simple-digital.pdf"
+
+        def _fail_on_original(in_path: Path, out_path: Path, **kwargs) -> None:
+            if in_path == original:
                 raise ParseError("Does not compute.")
-            run_convert(input_file=input_file, output_file=output_file, **kwargs)
+            rasterize_pdf_page_to_png(in_path, out_path, **kwargs)
 
-        mocker.patch("documents.parsers.run_convert", side_effect=_raise_on_pdf)
-
-        thumb = tesseract_parser.get_thumbnail(
-            tesseract_samples_dir / "simple-digital.pdf",
-            "application/pdf",
+        rasterize = mocker.patch(
+            "documents.parsers.rasterize_pdf_page_to_png",
+            side_effect=_fail_on_original,
         )
+
+        thumb = tesseract_parser.get_thumbnail(original, "application/pdf")
+
+        assert rasterize.call_count == 2
         assert thumb.is_file()
+        assert thumb.name == "convert_qpdf.webp"
+        with Image.open(thumb) as im:
+            assert im.format == "WEBP"
+            assert im.width == 500
 
     def test_thumbnail_encrypted_pdf(
         self,
@@ -906,6 +924,34 @@ class TestSkipArchive:
         assert tesseract_parser.archive_path is None
         assert tesseract_parser.get_text()
 
+    def test_tagged_pdf_without_text_does_not_skip_ocr(
+        self,
+        mocker: MockerFixture,
+        tesseract_parser: RasterisedDocumentParser,
+        tagged_no_text_pdf_file: Path,
+    ) -> None:
+        """
+        GIVEN:
+            - A real PDF that reports itself as tagged (/MarkInfo /Marked
+              true) but whose only pdftotext output is layout padding (a
+              lone form-feed byte), not real text (see GitHub issue #13387,
+              originally reported against #13349's tagged-PDF handling)
+            - Mode: auto, produce_archive=False
+        WHEN:
+            - Document is parsed
+        THEN:
+            - The tag alone is not trusted as "has text"; OCRmyPDF still runs
+        """
+        assert is_tagged_pdf(tagged_no_text_pdf_file) is True
+        tesseract_parser.settings.mode = ModeChoices.AUTO
+        mock_ocr = mocker.patch("ocrmypdf.ocr")
+        tesseract_parser.parse(
+            tagged_no_text_pdf_file,
+            "application/pdf",
+            produce_archive=False,
+        )
+        mock_ocr.assert_called()
+
     def test_tagged_pdf_produces_pdfa_archive_without_ocr(
         self,
         tesseract_parser: RasterisedDocumentParser,
@@ -1279,6 +1325,8 @@ class TestParserFileTypes:
 # ---------------------------------------------------------------------------
 
 
+# Remote ocr config from ApplicationConfiguration needs DB access
+@pytest.mark.django_db
 class TestRasterisedDocumentParserRegistry:
     def test_registered_in_defaults(self) -> None:
         from paperless.parsers.registry import ParserRegistry

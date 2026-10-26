@@ -22,8 +22,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Self
 
-from bleach import clean
-from bleach import linkify
 from django.conf import settings
 from django.utils import timezone
 from django.utils.timezone import is_naive
@@ -38,6 +36,9 @@ from humanize import naturalsize
 from imap_tools import MailAttachment
 from imap_tools import MailMessage
 from tika_client import TikaClient
+from turbohtml.clean import Linkify
+from turbohtml.clean import linkify
+from turbohtml.migration.bleach import clean
 
 from documents.parsers import ParseError
 from documents.parsers import make_thumbnail_from_pdf
@@ -266,10 +267,7 @@ class MailDocumentParser:
         logger.debug("Building formatted text from email")
         self._text = build_formatted_text(mail)
 
-        if is_naive(mail.date):
-            self._date = make_aware(mail.date)
-        else:
-            self._date = mail.date
+        self._date = mail.date
 
         logger.debug("Creating a PDF from the email")
         if self._mailrule_id:
@@ -285,15 +283,15 @@ class MailDocumentParser:
     # Result accessors
     # ------------------------------------------------------------------
 
-    def get_text(self) -> str | None:
+    def get_text(self) -> str:
         """Return the plain-text content extracted during parse.
 
         Returns
         -------
-        str | None
-            Extracted text, or None if parse has not been called yet.
+        str
+            Extracted text, or an empty string if no text could be found.
         """
-        return self._text
+        return self._text or ""
 
     def get_date(self) -> datetime.datetime | None:
         """Return the document date detected during parse.
@@ -496,6 +494,9 @@ class MailDocumentParser:
                 f"Could not parse {filepath}: {err}",
             ) from err
 
+        if is_naive(parsed.date):
+            parsed.date = make_aware(parsed.date)
+
         return parsed
 
     def tika_parse(self, html: str) -> str:
@@ -627,7 +628,7 @@ class MailDocumentParser:
                 text = str(text)
             text = escape(text)
             text = clean(text)
-            text = linkify(text, parse_email=True)
+            text = linkify(text, Linkify(parse_email=True))
             text = text.replace("\n", "<br>")
             return text
 

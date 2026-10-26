@@ -20,8 +20,9 @@ if TYPE_CHECKING:
 from documents.file_handling import generate_filename
 from documents.models import Document
 from documents.tasks import update_document_content_maybe_archive_file
-from documents.tests.utils import DirectoriesMixin
-from documents.tests.utils import FileSystemAssertsMixin
+from paperless_testing.assertions import FileSystemAssertsMixin
+from paperless_testing.dirs import DirectoriesMixin
+from paperless_testing.factories import DocumentFactory
 
 sample_file: Path = Path(__file__).parent / "samples" / "simple.pdf"
 
@@ -116,6 +117,27 @@ class TestMakeIndex:
         call_command("document_index", "reindex", skip_checks=True)
         mock_get_backend.return_value.rebuild.assert_called_once()
 
+    def test_reindex_skips_versions(self, mocker: MockerFixture) -> None:
+        """
+        GIVEN:
+            - A root document with a version
+        WHEN:
+            - The reindex command runs
+        THEN:
+            - Only the root document is handed to the rebuild, since a version
+              is indexed as its root
+        """
+        root = DocumentFactory()
+        DocumentFactory(root_document=root, version_index=1)
+        mock_get_backend = mocker.patch(
+            "documents.management.commands.document_index.get_backend",
+        )
+
+        call_command("document_index", "reindex", skip_checks=True)
+
+        documents = mock_get_backend.return_value.rebuild.call_args.args[0]
+        assert list(documents.values_list("pk", flat=True)) == [root.pk]
+
     def test_optimize(self) -> None:
         """Optimize command must execute without error (Tantivy handles optimization automatically)."""
         call_command("document_index", "optimize", skip_checks=True)
@@ -175,6 +197,35 @@ class TestMakeIndex:
         )
         call_command("document_index", "reindex", if_needed=True, skip_checks=True)
         mock_get_backend.return_value.rebuild.assert_called_once()
+
+    def test_reindex_default_heap_size_not_overridden(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        """Without --heap-size-mb, rebuild must use its own default heap size."""
+        mock_get_backend = mocker.patch(
+            "documents.management.commands.document_index.get_backend",
+        )
+        call_command("document_index", "reindex", skip_checks=True)
+        _, kwargs = mock_get_backend.return_value.rebuild.call_args
+        assert "writer_heap_bytes" not in kwargs
+
+    def test_reindex_heap_size_mb_passed_to_rebuild(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        """--heap-size-mb must convert to bytes and pass through to rebuild."""
+        mock_get_backend = mocker.patch(
+            "documents.management.commands.document_index.get_backend",
+        )
+        call_command(
+            "document_index",
+            "reindex",
+            heap_size_mb=128,
+            skip_checks=True,
+        )
+        _, kwargs = mock_get_backend.return_value.rebuild.call_args
+        assert kwargs["writer_heap_bytes"] == 128_000_000
 
 
 @pytest.mark.management

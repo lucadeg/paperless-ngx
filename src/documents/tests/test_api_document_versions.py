@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+import datetime
 from typing import TYPE_CHECKING
-from unittest import TestCase
 from unittest import mock
 
 from auditlog.models import LogEntry  # type: ignore[import-untyped]
-from django.contrib.auth.models import Permission
-from django.contrib.auth.models import User
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import FieldError
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import TestCase as DjangoTestCase
+from django.test import override_settings
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -17,8 +17,17 @@ from documents.data_models import DocumentSource
 from documents.filters import EffectiveContentFilter
 from documents.filters import TitleContentFilter
 from documents.models import Document
-from documents.tests.utils import DirectoriesMixin
-from documents.tests.utils import read_streaming_response
+from documents.models import Note
+from documents.models import ShareLink
+from documents.versioning import annotate_effective_content
+from documents.views import DocumentSelectionMixin
+from paperless_testing.dirs import DirectoriesMixin
+from paperless_testing.factories import DocumentFactory
+from paperless_testing.factories import UserFactory
+from paperless_testing.http import read_streaming_response
+from paperless_testing.permissions import grant_all_global
+from paperless_testing.permissions import grant_global
+from paperless_testing.permissions import grant_object
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -28,7 +37,7 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
     def setUp(self) -> None:
         super().setUp()
 
-        self.user = User.objects.create_superuser(username="temp_admin")
+        self.user = UserFactory(username="temp_admin", superuser=True)
         self.client.force_authenticate(user=self.user)
 
     def _make_pdf_upload(self, name: str = "version.pdf") -> SimpleUploadedFile:
@@ -86,11 +95,9 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_root_endpoint_returns_403_when_user_lacks_permission(self) -> None:
-        owner = User.objects.create_user(username="owner")
-        viewer = User.objects.create_user(username="viewer")
-        viewer.user_permissions.add(
-            Permission.objects.get(codename="view_document"),
-        )
+        owner = UserFactory(username="owner")
+        viewer = UserFactory(username="viewer")
+        grant_global(viewer, "view_document")
         root = Document.objects.create(
             title="root",
             checksum="root",
@@ -137,6 +144,8 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
             root_document=root,
             content="v2-content",
         )
+        original_modified = timezone.now() - datetime.timedelta(days=1)
+        Document.objects.filter(pk=root.pk).update(modified=original_modified)
 
         with mock.patch("documents.search.get_backend"):
             resp = self.client.delete(f"/api/documents/{root.id}/versions/{v2.id}/")
@@ -146,6 +155,7 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         self.assertEqual(resp.data["current_version_id"], v1.id)
         root.refresh_from_db()
         self.assertEqual(root.content, "root-content")
+        self.assertGreater(root.modified, original_modified)
 
         with mock.patch("documents.search.get_backend"):
             resp = self.client.delete(f"/api/documents/{root.id}/versions/{v1.id}/")
@@ -277,11 +287,9 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         self.assertEqual(mock_backend.add_or_update.call_args[0][0].id, root.id)
 
     def test_delete_version_returns_403_without_permission(self) -> None:
-        owner = User.objects.create_user(username="owner")
-        other = User.objects.create_user(username="other")
-        other.user_permissions.add(
-            Permission.objects.get(codename="delete_document"),
-        )
+        owner = UserFactory(username="owner")
+        other = UserFactory(username="other")
+        grant_global(other, "delete_document")
         root = Document.objects.create(
             title="root",
             checksum="root",
@@ -326,6 +334,8 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
             root_document=root,
             version_label="old",
         )
+        original_modified = timezone.now() - datetime.timedelta(days=1)
+        Document.objects.filter(pk=root.pk).update(modified=original_modified)
 
         resp = self.client.patch(
             f"/api/documents/{root.id}/versions/{version.id}/",
@@ -339,6 +349,8 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         self.assertEqual(resp.data["version_label"], "Label 1")
         self.assertEqual(resp.data["id"], version.id)
         self.assertFalse(resp.data["is_root"])
+        root.refresh_from_db()
+        self.assertGreater(root.modified, original_modified)
 
     def test_update_version_label_clears_on_blank(self) -> None:
         root = Document.objects.create(
@@ -361,11 +373,9 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         self.assertTrue(resp.data["is_root"])
 
     def test_update_version_label_returns_403_without_permission(self) -> None:
-        owner = User.objects.create_user(username="owner")
-        other = User.objects.create_user(username="other")
-        other.user_permissions.add(
-            Permission.objects.get(codename="change_document"),
-        )
+        owner = UserFactory(username="owner")
+        other = UserFactory(username="other")
+        grant_global(other, "change_document")
         root = Document.objects.create(
             title="root",
             checksum="root",
@@ -464,6 +474,40 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(read_streaming_response(resp), b"thumb")
 
+    def test_thumb_etag_changes_when_latest_version_is_deleted(self) -> None:
+        root = self._create_pdf(title="root", checksum="root")
+        v1 = self._create_pdf(
+            title="v1",
+            checksum="v1",
+            root_document=root,
+        )
+        v2 = self._create_pdf(
+            title="v2",
+            checksum="v2",
+            root_document=root,
+        )
+        self._write_file(v1.thumbnail_path, b"thumb-v1")
+        self._write_file(v2.thumbnail_path, b"thumb-v2")
+
+        resp = self.client.get(f"/api/documents/{root.id}/thumb/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(read_streaming_response(resp), b"thumb-v2")
+        self.assertEqual(resp.headers["ETag"], '"v2"')
+
+        with mock.patch("documents.search.get_backend"):
+            delete_resp = self.client.delete(
+                f"/api/documents/{root.id}/versions/{v2.id}/",
+            )
+        self.assertEqual(delete_resp.status_code, status.HTTP_200_OK)
+
+        resp = self.client.get(
+            f"/api/documents/{root.id}/thumb/",
+            HTTP_IF_NONE_MATCH='"v2"',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.headers["ETag"], '"v1"')
+        self.assertEqual(read_streaming_response(resp), b"thumb-v1")
+
     def test_metadata_version_param_uses_version(self) -> None:
         root = Document.objects.create(
             title="root",
@@ -509,11 +553,9 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_metadata_returns_403_when_user_lacks_permission(self) -> None:
-        owner = User.objects.create_user(username="owner")
-        other = User.objects.create_user(username="other")
-        other.user_permissions.add(
-            Permission.objects.get(codename="view_document"),
-        )
+        owner = UserFactory(username="owner")
+        other = UserFactory(username="other")
+        grant_global(other, "view_document")
         doc = Document.objects.create(
             title="root",
             checksum="root",
@@ -553,6 +595,7 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         self.assertEqual(input_doc.root_document_id, root.id)
         self.assertEqual(input_doc.source, DocumentSource.ApiUpload)
         self.assertEqual(overrides.version_label, "New Version")
+        self.assertEqual(overrides.owner_id, self.user.id)
         self.assertEqual(overrides.actor_id, self.user.id)
 
     def test_update_version_with_version_pk_normalizes_to_root(self) -> None:
@@ -608,8 +651,8 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     def test_update_version_returns_403_without_permission(self) -> None:
-        owner = User.objects.create_user(username="owner")
-        other = User.objects.create_user(username="other")
+        owner = UserFactory(username="owner")
+        other = UserFactory(username="other")
         root = Document.objects.create(
             title="root",
             checksum="root",
@@ -625,6 +668,26 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         )
 
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_update_version_requires_global_change_permission(self) -> None:
+        user = UserFactory(username="add-only")
+        grant_global(user, "add_document")
+        root = Document.objects.create(
+            title="root",
+            checksum="root",
+            mime_type="application/pdf",
+        )
+        self.client.force_authenticate(user=user)
+
+        with mock.patch("documents.views.consume_file") as consume_mock:
+            resp = self.client.post(
+                f"/api/documents/{root.id}/update_version/",
+                {"document": self._make_pdf_upload()},
+                format="multipart",
+            )
+
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        consume_mock.apply_async.assert_not_called()
 
     def test_update_version_returns_404_for_missing_document(self) -> None:
         resp = self.client.post(
@@ -764,33 +827,186 @@ class TestDocumentVersioningApi(DirectoriesMixin, APITestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(resp.data["content"], "v1-content")
 
+    def test_page_count_resolves_to_latest_version(self) -> None:
+        root = DocumentFactory(page_count=2)
+        DocumentFactory(root_document=root, version_index=1, page_count=1)
+        unversioned = DocumentFactory(page_count=5)
 
-class TestVersionAwareFilters(TestCase):
-    def test_title_content_filter_falls_back_to_content(self) -> None:
-        queryset = mock.Mock()
-        fallback_queryset = mock.Mock()
-        queryset.filter.side_effect = [FieldError("missing field"), fallback_queryset]
+        resp = self.client.get("/api/documents/?fields=id,page_count")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            {doc["id"]: doc["page_count"] for doc in resp.data["results"]},
+            {root.id: 1, unversioned.id: 5},
+        )
 
-        result = TitleContentFilter().filter(queryset, " latest ")
+        resp = self.client.get(f"/api/documents/{root.id}/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data["page_count"], 1)
 
-        self.assertIs(result, fallback_queryset)
-        self.assertEqual(queryset.filter.call_count, 2)
+        resp = self.client.get(f"/api/documents/{root.id}/?version={root.id}")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data["page_count"], 2)
 
-    def test_effective_content_filter_falls_back_to_content_lookup(self) -> None:
-        queryset = mock.Mock()
-        fallback_queryset = mock.Mock()
-        queryset.filter.side_effect = [FieldError("missing field"), fallback_queryset]
+    def _make_root_with_out_of_order_versions(self) -> tuple[Document, ...]:
+        """
+        A root whose newest version has a *lower* id than an older one, which is
+        what merging an existing document in as a version produces.
+        """
+        root = Document.objects.create(
+            title="root",
+            checksum="root",
+            mime_type="application/pdf",
+            content="root-content",
+        )
+        newest = Document.objects.create(
+            title="newest",
+            checksum="newest",
+            mime_type="application/pdf",
+            content="newest-content",
+        )
+        older = Document.objects.create(
+            title="older",
+            checksum="older",
+            mime_type="application/pdf",
+            root_document=root,
+            version_index=1,
+            content="older-content",
+        )
+        # Assigned last, so `newest` has the lower id despite being the later version
+        newest.root_document = root
+        newest.version_index = 2
+        newest.save()
+        return root, newest, older
 
-        result = EffectiveContentFilter(lookup_expr="icontains").filter(
-            queryset,
+    def test_retrieve_uses_version_index_not_id_for_latest(self) -> None:
+        root, _, _ = self._make_root_with_out_of_order_versions()
+
+        resp = self.client.get(f"/api/documents/{root.id}/")
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data["content"], "newest-content")
+
+    def test_list_uses_version_index_not_id_for_latest(self) -> None:
+        self._make_root_with_out_of_order_versions()
+
+        resp = self.client.get("/api/documents/?fields=id,content")
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [doc["content"] for doc in resp.data["results"]],
+            ["newest-content"],
+        )
+
+    def test_versions_are_listed_newest_first_with_root_last(self) -> None:
+        root, newest, older = self._make_root_with_out_of_order_versions()
+
+        resp = self.client.get(f"/api/documents/{root.id}/")
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [(version["id"], version["is_root"]) for version in resp.data["versions"]],
+            [(newest.id, False), (older.id, False), (root.id, True)],
+        )
+
+
+class TestVersionAwareFilters(DjangoTestCase):
+    """
+    The filters annotate effective_content themselves rather than relying on
+    the caller's queryset carrying it, so they stay version-aware on a plain
+    Document queryset (e.g. the bulk-edit "select all matching" path).
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = Document.objects.create(
+            title="root",
+            checksum="root",
+            mime_type="application/pdf",
+            content="superseded-content",
+        )
+        Document.objects.create(
+            title="version",
+            checksum="version",
+            mime_type="application/pdf",
+            root_document=self.root,
+            version_index=1,
+            content="latest-content",
+        )
+        self.unversioned = Document.objects.create(
+            title="unversioned",
+            checksum="unversioned",
+            mime_type="application/pdf",
+            content="latest-content",
+        )
+
+    def test_title_content_filter_matches_latest_version_content(self) -> None:
+        result = TitleContentFilter().filter(
+            Document.objects.filter(root_document__isnull=True),
             " latest ",
         )
 
-        self.assertIs(result, fallback_queryset)
-        first_kwargs = queryset.filter.call_args_list[0].kwargs
-        second_kwargs = queryset.filter.call_args_list[1].kwargs
-        self.assertEqual(first_kwargs, {"effective_content__icontains": "latest"})
-        self.assertEqual(second_kwargs, {"content__icontains": "latest"})
+        self.assertCountEqual(
+            [doc.id for doc in result],
+            [self.root.id, self.unversioned.id],
+        )
+
+    def test_effective_content_filter_matches_latest_version_content(self) -> None:
+        result = EffectiveContentFilter(lookup_expr="icontains").filter(
+            Document.objects.filter(root_document__isnull=True),
+            " latest ",
+        )
+
+        self.assertCountEqual(
+            [doc.id for doc in result],
+            [self.root.id, self.unversioned.id],
+        )
+
+    def test_effective_content_filter_ignores_superseded_content(self) -> None:
+        result = EffectiveContentFilter(lookup_expr="icontains").filter(
+            Document.objects.filter(root_document__isnull=True),
+            "superseded",
+        )
+
+        self.assertEqual(list(result), [])
+
+    def test_filters_reuse_an_existing_annotation(self) -> None:
+        """
+        Annotating twice under the same alias is an error, so an already
+        annotated queryset (the search path) has to be left alone.
+        """
+        annotated = annotate_effective_content(
+            Document.objects.filter(root_document__isnull=True),
+        )
+        self.assertIs(annotate_effective_content(annotated), annotated)
+
+        result = EffectiveContentFilter(lookup_expr="icontains").filter(
+            annotated,
+            "latest",
+        )
+
+        self.assertCountEqual(
+            [doc.id for doc in result],
+            [self.root.id, self.unversioned.id],
+        )
+
+    def test_bulk_selection_does_not_match_superseded_content(self) -> None:
+        """
+        Bulk edit's "select all matching" builds its own queryset, so before
+        the filters annotated for themselves it matched the root document's
+        superseded content -- selecting documents the list view, filtered by
+        the same term, does not show.
+        """
+        user = UserFactory(username="bulk_selection", superuser=True)
+
+        selected = DocumentSelectionMixin()._resolve_document_ids(
+            user=user,
+            validated_data={
+                "all": True,
+                "filters": {"content__icontains": "superseded"},
+            },
+        )
+
+        self.assertEqual(selected, [])
 
     def test_effective_content_filter_returns_input_for_empty_values(self) -> None:
         queryset = mock.Mock()
@@ -799,3 +1015,185 @@ class TestVersionAwareFilters(TestCase):
 
         self.assertIs(result, queryset)
         queryset.filter.assert_not_called()
+
+
+class TestBulkSelectionExcludesVersions(DjangoTestCase):
+    def test_select_all_matching_does_not_select_version_documents(self) -> None:
+        """
+        "Select all matching" reconstructs the document list, which never
+        contains version documents as rows of their own.
+        """
+        user = UserFactory(username="bulk_versions", superuser=True)
+        root = Document.objects.create(
+            title="shared-title root",
+            checksum="bulk-root",
+            mime_type="application/pdf",
+            content="root",
+        )
+        Document.objects.create(
+            title="shared-title version",
+            checksum="bulk-version",
+            mime_type="application/pdf",
+            root_document=root,
+            version_index=1,
+            content="version",
+        )
+
+        selected = DocumentSelectionMixin()._resolve_document_ids(
+            user=user,
+            validated_data={
+                "all": True,
+                "filters": {"title__icontains": "shared-title"},
+            },
+        )
+
+        self.assertEqual(selected, [root.id])
+
+
+class TestVersionActionPermissions(DirectoriesMixin, APITestCase):
+    def setUp(self):
+        super().setUp()
+        self.user = UserFactory()
+        grant_all_global(self.user)
+        self.client.force_authenticate(self.user)
+        self.root = DocumentFactory(owner=UserFactory())
+        self.version = DocumentFactory(root_document=self.root, owner=None)
+
+    @override_settings(AUDIT_LOG_ENABLED=True)
+    def test_actions_reject_stale_version_ownership(self):
+        note = Note.objects.create(document=self.version, note="Version note")
+        for owner in (None, self.user):
+            self.version.owner = owner
+            self.version.save(update_fields=["owner"])
+            for action in (
+                "notes",
+                "suggestions",
+                "ai_suggestions",
+                "history",
+                "share_links",
+            ):
+                with self.subTest(owner=owner, action=action):
+                    response = self.client.get(
+                        f"/api/documents/{self.version.pk}/{action}/",
+                    )
+                    self.assertEqual(response.status_code, 403)
+            response = self.client.post(
+                f"/api/documents/{self.version.pk}/notes/",
+                {"note": "New note"},
+            )
+            self.assertEqual(response.status_code, 403)
+            response = self.client.delete(
+                f"/api/documents/{self.version.pk}/notes/?id={note.pk}",
+            )
+            self.assertEqual(response.status_code, 403)
+            response = self.client.post(
+                "/api/share_links/",
+                {"document": self.version.pk, "file_version": "original"},
+            )
+            self.assertEqual(response.status_code, 403)
+            response = self.client.post(
+                "/api/share_link_bundles/",
+                {"document_ids": [self.version.pk], "file_version": "original"},
+                format="json",
+            )
+            self.assertEqual(response.status_code, 400)
+            response = self.client.post(
+                "/api/documents/email/",
+                {
+                    "documents": [self.version.pk],
+                    "addresses": "recipient@example.com",
+                    "subject": "Version",
+                    "message": "Version",
+                },
+                format="json",
+            )
+            self.assertEqual(response.status_code, 403)
+            with (
+                mock.patch("documents.views.AIConfig") as ai_config,
+                mock.patch("documents.views.stream_chat_with_documents") as chat,
+            ):
+                ai_config.return_value.ai_enabled = True
+                response = self.client.post(
+                    "/api/documents/chat/",
+                    {"q": "Version?", "document_id": self.version.pk},
+                    format="json",
+                )
+            self.assertEqual(response.status_code, 403)
+            chat.assert_not_called()
+        self.assertTrue(Note.objects.filter(pk=note.pk).exists())
+        self.assertFalse(ShareLink.objects.exists())
+
+    @mock.patch("documents.views.build_share_link_bundle.apply_async")
+    def test_root_permissions_allow_sharing_a_private_version(self, build_mock):
+        self.version.owner = UserFactory()
+        self.version.save(update_fields=["owner"])
+        grant_object(self.user, self.root, "view_document", "change_document")
+        note = Note.objects.create(document=self.version, note="Version note")
+        response = self.client.get(f"/api/documents/{self.version.pk}/notes/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data[0]["id"], note.pk)
+        response = self.client.post(
+            "/api/share_links/",
+            {"document": self.version.pk, "file_version": "original"},
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(ShareLink.objects.get().document_id, self.version.pk)
+        response = self.client.get(f"/api/documents/{self.version.pk}/share_links/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        response = self.client.post(
+            "/api/share_link_bundles/",
+            {"document_ids": [self.version.pk], "file_version": "original"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        build_mock.assert_called_once()
+
+    def test_root_view_permission_does_not_allow_note_changes(self):
+        grant_object(self.user, self.root, "view_document")
+        note = Note.objects.create(document=self.version, note="Version note")
+        response = self.client.get(f"/api/documents/{self.version.pk}/notes/")
+        self.assertEqual(response.status_code, 200)
+        response = self.client.post(
+            f"/api/documents/{self.version.pk}/notes/",
+            {"note": "New note"},
+        )
+        self.assertEqual(response.status_code, 403)
+        response = self.client.delete(
+            f"/api/documents/{self.version.pk}/notes/?id={note.pk}",
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(Note.objects.filter(pk=note.pk).exists())
+
+    @override_settings(AUDIT_LOG_ENABLED=True)
+    def test_history_uses_root_ownership(self):
+        self.root.owner = self.user
+        self.root.save(update_fields=["owner"])
+        self.version.owner = UserFactory()
+        self.version.save(update_fields=["owner"])
+        response = self.client.get(f"/api/documents/{self.version.pk}/history/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_selection_data_rejects_stale_version_ownership(self):
+        for owner in (None, self.user):
+            self.version.owner = owner
+            self.version.save(update_fields=["owner"])
+            with self.subTest(owner=owner):
+                response = self.client.post(
+                    "/api/documents/selection_data/",
+                    {"documents": [self.version.pk]},
+                    format="json",
+                )
+                self.assertEqual(response.status_code, 403)
+
+    def test_selection_data_allows_private_version_of_permitted_root(self):
+        self.version.owner = UserFactory()
+        self.version.save(update_fields=["owner"])
+        grant_object(self.user, self.root, "view_document")
+        other = DocumentFactory(owner=self.user)
+        response = self.client.post(
+            "/api/documents/selection_data/",
+            {"documents": [self.version.pk, other.pk]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)

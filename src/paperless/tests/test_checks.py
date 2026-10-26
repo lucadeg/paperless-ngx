@@ -1,6 +1,6 @@
 import os
+import shutil
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
@@ -8,62 +8,54 @@ import pytest
 from django.core.checks import ERROR
 from django.core.checks import Error
 from django.core.checks import Warning
-from pytest_django.fixtures import SettingsWrapper
+from pytest_django.fixtures import Settings
 from pytest_mock import MockerFixture
 
 from paperless.checks import audit_log_check
 from paperless.checks import binaries_check
 from paperless.checks import check_default_language_available
 from paperless.checks import check_deprecated_db_settings
-from paperless.checks import check_remote_parser_configured
 from paperless.checks import check_v3_minimum_upgrade_version
 from paperless.checks import debug_mode_check
 from paperless.checks import paths_check
 from paperless.checks import settings_values_check
-
-
-@dataclass(frozen=True, slots=True)
-class PaperlessTestDirs:
-    data_dir: Path
-    media_dir: Path
-    consumption_dir: Path
-
-
-# TODO: consolidate with documents/tests/conftest.py PaperlessDirs/paperless_dirs
-#       once the paperless and documents test suites are ready to share fixtures.
-@pytest.fixture()
-def directories(tmp_path: Path, settings: SettingsWrapper) -> PaperlessTestDirs:
-    data_dir = tmp_path / "data"
-    media_dir = tmp_path / "media"
-    consumption_dir = tmp_path / "consumption"
-
-    for d in (data_dir, media_dir, consumption_dir):
-        d.mkdir()
-
-    settings.DATA_DIR = data_dir
-    settings.MEDIA_ROOT = media_dir
-    settings.CONSUMPTION_DIR = consumption_dir
-
-    return PaperlessTestDirs(
-        data_dir=data_dir,
-        media_dir=media_dir,
-        consumption_dir=consumption_dir,
-    )
+from paperless_testing.dirs import PaperlessDirs
 
 
 class TestChecks:
     def test_binaries(self) -> None:
         assert binaries_check(None) == []
 
-    def test_binaries_fail(self, settings: SettingsWrapper) -> None:
-        settings.CONVERT_BINARY = "uuuhh"
-        assert len(binaries_check(None)) == 1
+    def test_binaries_fail(self, mocker: MockerFixture) -> None:
+        """
+        GIVEN:
+            - None of tesseract, ghostscript, pdftoppm or pdfinfo can be found
+        WHEN:
+            - The binaries check runs
+        THEN:
+            - One warning is raised per missing binary
+        """
+        mocker.patch("paperless.checks.shutil.which", return_value=None)
+        assert len(binaries_check(None)) == 4
 
-    @pytest.mark.usefixtures("directories")
+    @pytest.mark.parametrize("binary", ["pdftoppm", "pdfinfo"])
+    def test_binaries_fail_poppler(self, mocker: MockerFixture, binary: str) -> None:
+        real_which = shutil.which
+        mocker.patch(
+            "paperless.checks.shutil.which",
+            side_effect=lambda name: None if name == binary else real_which(name),
+        )
+
+        msgs = binaries_check(None)
+
+        assert len(msgs) == 1
+        assert binary in msgs[0].msg
+
+    @pytest.mark.usefixtures("paperless_dirs")
     def test_paths_check(self) -> None:
         assert paths_check(None) == []
 
-    def test_paths_check_dont_exist(self, settings: SettingsWrapper) -> None:
+    def test_paths_check_dont_exist(self, settings: Settings) -> None:
         settings.MEDIA_ROOT = Path("uuh")
         settings.DATA_DIR = Path("whatever")
         settings.CONSUMPTION_DIR = Path("idontcare")
@@ -74,27 +66,27 @@ class TestChecks:
         for msg in msgs:
             assert msg.msg.endswith("is set but doesn't exist.")
 
-    def test_paths_check_no_access(self, directories: PaperlessTestDirs) -> None:
-        directories.data_dir.chmod(0o000)
-        directories.media_dir.chmod(0o000)
-        directories.consumption_dir.chmod(0o000)
+    def test_paths_check_no_access(self, paperless_dirs: PaperlessDirs) -> None:
+        paperless_dirs.data_dir.chmod(0o000)
+        paperless_dirs.media_dir.chmod(0o000)
+        paperless_dirs.consumption_dir.chmod(0o000)
 
         try:
             msgs = paths_check(None)
         finally:
-            directories.data_dir.chmod(0o777)
-            directories.media_dir.chmod(0o777)
-            directories.consumption_dir.chmod(0o777)
+            paperless_dirs.data_dir.chmod(0o777)
+            paperless_dirs.media_dir.chmod(0o777)
+            paperless_dirs.consumption_dir.chmod(0o777)
 
         assert len(msgs) == 3
         for msg in msgs:
             assert msg.msg.endswith("is not writeable")
 
-    def test_debug_disabled(self, settings: SettingsWrapper) -> None:
+    def test_debug_disabled(self, settings: Settings) -> None:
         settings.DEBUG = False
         assert debug_mode_check(None) == []
 
-    def test_debug_enabled(self, settings: SettingsWrapper) -> None:
+    def test_debug_enabled(self, settings: Settings) -> None:
         settings.DEBUG = True
         assert len(debug_mode_check(None)) == 1
 
@@ -151,7 +143,7 @@ class TestOcrSettingsChecks:
     )
     def test_invalid_setting_produces_one_error(
         self,
-        settings: SettingsWrapper,
+        settings: Settings,
         setting: str,
         value: str,
         expected_msg: str,
@@ -174,7 +166,7 @@ class TestOcrSettingsChecks:
 
 
 class TestTimezoneSettingsChecks:
-    def test_invalid_timezone(self, settings: SettingsWrapper) -> None:
+    def test_invalid_timezone(self, settings: Settings) -> None:
         """
         GIVEN:
             - Default settings
@@ -193,7 +185,7 @@ class TestTimezoneSettingsChecks:
 
 
 class TestEmailCertSettingsChecks:
-    def test_not_valid_file(self, settings: SettingsWrapper) -> None:
+    def test_not_valid_file(self, settings: Settings) -> None:
         """
         GIVEN:
             - Default settings
@@ -216,7 +208,7 @@ class TestEmailCertSettingsChecks:
 class TestAuditLogChecks:
     def test_was_enabled_once(
         self,
-        settings: SettingsWrapper,
+        settings: Settings,
         mocker: MockerFixture,
     ) -> None:
         """
@@ -241,14 +233,14 @@ class TestAuditLogChecks:
         assert "auditlog table was found but audit log is disabled." in msgs[0].msg
 
 
-DEPRECATED_VARS: dict[str, str] = {
-    "PAPERLESS_DB_TIMEOUT": "timeout",
-    "PAPERLESS_DB_POOLSIZE": "pool.min_size / pool.max_size",
-    "PAPERLESS_DBSSLMODE": "sslmode",
-    "PAPERLESS_DBSSLROOTCERT": "sslrootcert",
-    "PAPERLESS_DBSSLCERT": "sslcert",
-    "PAPERLESS_DBSSLKEY": "sslkey",
-}
+DEPRECATED_VARS = (
+    "PAPERLESS_DB_TIMEOUT",
+    "PAPERLESS_DB_POOLSIZE",
+    "PAPERLESS_DBSSLMODE",
+    "PAPERLESS_DBSSLROOTCERT",
+    "PAPERLESS_DBSSLCERT",
+    "PAPERLESS_DBSSLKEY",
+)
 
 
 class TestDeprecatedDbSettings:
@@ -264,26 +256,11 @@ class TestDeprecatedDbSettings:
         result = check_deprecated_db_settings(None)
         assert result == []
 
-    @pytest.mark.parametrize(
-        ("env_var", "db_option_key"),
-        [
-            pytest.param("PAPERLESS_DB_TIMEOUT", "timeout", id="db-timeout"),
-            pytest.param(
-                "PAPERLESS_DB_POOLSIZE",
-                "pool.min_size / pool.max_size",
-                id="db-poolsize",
-            ),
-            pytest.param("PAPERLESS_DBSSLMODE", "sslmode", id="ssl-mode"),
-            pytest.param("PAPERLESS_DBSSLROOTCERT", "sslrootcert", id="ssl-rootcert"),
-            pytest.param("PAPERLESS_DBSSLCERT", "sslcert", id="ssl-cert"),
-            pytest.param("PAPERLESS_DBSSLKEY", "sslkey", id="ssl-key"),
-        ],
-    )
+    @pytest.mark.parametrize("env_var", DEPRECATED_VARS)
     def test_single_deprecated_var_produces_one_warning(
         self,
         mocker: MockerFixture,
         env_var: str,
-        db_option_key: str,
     ) -> None:
         """Each deprecated var in isolation produces exactly one warning."""
         mocker.patch.dict(os.environ, {env_var: "some_value"}, clear=True)
@@ -294,7 +271,8 @@ class TestDeprecatedDbSettings:
         assert isinstance(warning, Warning)
         assert warning.id == "paperless.W001"
         assert env_var in warning.hint
-        assert db_option_key in warning.hint
+        assert "PAPERLESS_DB_OPTIONS" in warning.hint
+        assert "https://docs.paperless-ngx.com/migration-v3/" in warning.hint
 
     def test_multiple_deprecated_vars_produce_one_warning_each(
         self,
@@ -584,11 +562,11 @@ class TestV3MinimumUpgradeVersionCheck:
     ) -> None:
         """
         GIVEN:
-            - DB is on an old v2 version (pre-v2.20.10)
+            - DB is on an old v2 version (pre-v2.20.15)
         WHEN:
             - The v3 upgrade check runs
         THEN:
-            - The error hint explicitly references v2.20.10 so users know what to do
+            - The error hint explicitly references v2.20.15 so users know what to do
         """
         mocker.patch.dict(
             "paperless.checks.connections",
@@ -596,7 +574,7 @@ class TestV3MinimumUpgradeVersionCheck:
         )
         result = check_v3_minimum_upgrade_version(None)
         assert len(result) == 1
-        assert "v2.20.10" in result[0].hint
+        assert "v2.20.15" in result[0].hint
 
     def test_db_error_is_swallowed(self, mocker: MockerFixture) -> None:
         """
@@ -631,36 +609,11 @@ class TestV3MinimumUpgradeVersionCheck:
         assert check_v3_minimum_upgrade_version(None) == []
 
 
-class TestRemoteParserChecks:
-    def test_no_engine(self, settings: SettingsWrapper) -> None:
-        settings.REMOTE_OCR_ENGINE = None
-        msgs = check_remote_parser_configured(None)
-
-        assert len(msgs) == 0
-
-    def test_azure_no_endpoint(self, settings: SettingsWrapper) -> None:
-
-        settings.REMOTE_OCR_ENGINE = "azureai"
-        settings.REMOTE_OCR_API_KEY = "somekey"
-        settings.REMOTE_OCR_ENDPOINT = None
-
-        msgs = check_remote_parser_configured(None)
-
-        assert len(msgs) == 1
-
-        msg = msgs[0]
-
-        assert (
-            "Azure AI remote parser requires endpoint and API key to be configured."
-            in msg.msg
-        )
-
-
 class TestTesseractChecks:
     def test_default_language(self) -> None:
         check_default_language_available(None)
 
-    def test_no_language(self, settings: SettingsWrapper) -> None:
+    def test_no_language(self, settings: Settings) -> None:
 
         settings.OCR_LANGUAGE = ""
 
@@ -675,7 +628,7 @@ class TestTesseractChecks:
 
     def test_invalid_language(
         self,
-        settings: SettingsWrapper,
+        settings: Settings,
         mocker: MockerFixture,
     ) -> None:
 
@@ -694,7 +647,7 @@ class TestTesseractChecks:
 
     def test_multi_part_language(
         self,
-        settings: SettingsWrapper,
+        settings: Settings,
         mocker: MockerFixture,
     ) -> None:
         """
@@ -718,7 +671,7 @@ class TestTesseractChecks:
 
     def test_multi_part_language_bad_format(
         self,
-        settings: SettingsWrapper,
+        settings: Settings,
         mocker: MockerFixture,
     ) -> None:
         """
